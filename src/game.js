@@ -105,7 +105,7 @@
   // ---------- 怪物类型 ----------
   const MON = {
     zombie: {
-      name: '僵尸', hp: 30, speed: 0.45, dmg: 8, atkRange: 18, atkCd: 700,
+      name: '僵尸', hp: 30, speed: 0.45, dmg: 8, atkRange: 38, atkCd: 700,
       xp: 10, color: '#5a7a3a', color2: '#3a5a2a', eye: '#d04040'
     },
     fogman: {
@@ -113,6 +113,8 @@
       xp: 20, color: '#9aa0b0', color2: '#6a7080', eye: '#e0e0f0', fog: true
     }
   };
+  // 僵尸衣着调色板（每只僵尸随机一种，让群体看起来穿着不同）
+  const ZOMBIE_CLOTHES = ['#5a3a2a','#3a3a4a','#4a3a5a','#6a4a2a','#2a4a4a','#5a4a3a','#7a3a3a','#3a4a3a','#4a2a2a','#3a3a2a'];
 
   // ====================================================================
   //  世界生成
@@ -311,7 +313,15 @@
       vx: 0, vy: 0,
       lastAtk: 0, hurtFlash: 0,
       wanderTx: x, wanderTy: y, nextWander: 0,
-      alive: true
+      alive: true,
+      // 渲染用：衣着、朝向、走路相位、扑咬方向
+      clothColor: choice(ZOMBIE_CLOTHES),
+      facing: 2,           // 1 左 2 右
+      walkPhase: Math.random() * 6,
+      atkDx: 0, atkDy: 1,   // 最近一次攻击的方向（朝向玩家）
+      atkDist: 0,           // 最近一次攻击时到玩家的距离（扑出刚好落到玩家位置）
+      pouncing: false,      // 这一轮是否在"扑"过来（贴身啃食时为 false，不跳不前扑）
+      atkSpread: Math.random() * 2 - 1   // 扑咬落点的侧向偏移，让多只僵尸围在玩家周围不同位置，不重叠
     };
   }
 
@@ -597,7 +607,8 @@
       bullets: [], cityItems: [],
       netMode: 'host', remotePlayers: [],
       scenes: new Map(),
-      needSave: false
+      needSave: false,
+      timeMs: 0
     };
     player.scene = 'city'; player.curBuilding = null; player.curFloor = 0;
     // 玩家放在 home 门口
@@ -687,7 +698,10 @@
       activateScene(bundle);
       const monsters = currentMonsters().map(m => ({
         kind: m.kind, x: Math.round(m.x), y: Math.round(m.y),
-        hp: m.hp, maxHp: m.maxHp, hurtFlash: m.hurtFlash || 0, alive: m.alive
+        hp: m.hp, maxHp: m.maxHp, hurtFlash: m.hurtFlash || 0, alive: m.alive,
+        clothColor: m.clothColor || null, facing: m.facing || 2,
+        walkPhase: m.walkPhase || 0, lastAtk: m.lastAtk || 0,
+        atkDx: m.atkDx || 0, atkDy: m.atkDy || 0, atkDist: m.atkDist || 0, pouncing: !!m.pouncing, atkSpread: m.atkSpread || 0
       }));
       let items = [];
       if (game.scene === 'interior') items = game.floor.items.filter(i=>!i.taken).map(i=>({x:i.x,y:i.y,type:i.type}));
@@ -744,7 +758,8 @@
       bullets: [], cityItems: [],
       netMode: 'client', remotePlayers: [],
       scenes: null, // 客户端不维护 scenes Map，靠快照里的 game.scene/floor
-      needSave: false
+      needSave: false,
+      timeMs: 0
     };
     player.scene = 'city'; player.curBuilding = null; player.curFloor = 0;
     const d = home.door;
@@ -790,13 +805,17 @@
       game.cityMonsters = (s.monsters||[]).map(m => ({
         kind: m.kind, x: m.x, y: m.y, hp: m.hp, maxHp: m.maxHp,
         hurtFlash: m.hurtFlash, alive: m.alive !== false,
-        lastAtk: 0, nextWander: 0, wanderTx: m.x, wanderTy: m.y
+        lastAtk: m.lastAtk || 0, nextWander: 0, wanderTx: m.x, wanderTy: m.y,
+        clothColor: m.clothColor || '#5a3a2a', facing: m.facing || 2,
+        walkPhase: m.walkPhase || 0, atkDx: m.atkDx || 0, atkDy: m.atkDy || 0, atkDist: m.atkDist || 0, pouncing: !!m.pouncing, atkSpread: m.atkSpread || 0
       }));
     } else if (game.floor) {
       game.floor.monsters = (s.monsters||[]).map(m => ({
         kind: m.kind, x: m.x, y: m.y, hp: m.hp, maxHp: m.maxHp,
         hurtFlash: m.hurtFlash, alive: m.alive !== false,
-        lastAtk: 0, nextWander: 0, wanderTx: m.x, wanderTy: m.y
+        lastAtk: m.lastAtk || 0, nextWander: 0, wanderTx: m.x, wanderTy: m.y,
+        clothColor: m.clothColor || '#5a3a2a', facing: m.facing || 2,
+        walkPhase: m.walkPhase || 0, atkDx: m.atkDx || 0, atkDy: m.atkDy || 0, atkDist: m.atkDist || 0, pouncing: !!m.pouncing, atkSpread: m.atkSpread || 0
       }));
     }
     // 物品
@@ -847,6 +866,7 @@
   // ---------- 客户端：发送输入 ----------
   function clientTick(dt) {
     if (!game || game.netMode !== 'client') return;
+    game.timeMs = (game.timeMs || 0) + dt;
     party.inputSendAcc += dt;
     // 发送输入 ~30Hz
     if (party.inputSendAcc < 33) { keyPressed = {}; return; }
@@ -900,7 +920,8 @@
       netMode: 'single',
       remotePlayers: [],
       scenes: new Map(),
-      needSave: false
+      needSave: false,
+      timeMs: 0  // 昼夜循环累计毫秒（10 分钟一轮，5 分钟白天 + 5 分钟夜晚）
     };
 
     // 玩家放在 home 楼门口外的路上
@@ -1001,7 +1022,8 @@
       stats: game.stats,
       scene: game.scene,
       curBuildingId: game.curBuilding ? game.curBuilding.id : null,
-      curFloor: game.curFloor
+      curFloor: game.curFloor,
+      timeMs: game.timeMs || 0
     };
   }
 
@@ -1054,7 +1076,8 @@
       bullets: [],
       netMode: 'single', remotePlayers: [],
       scenes: new Map(),
-      needSave: false
+      needSave: false,
+      timeMs: data.timeMs || 0
     };
     game.player.scene = 'city'; game.player.curBuilding = null; game.player.curFloor = 0;
     // 旧版存档兼容：子弹曾经放在 inv.ammo，现在统一到 p.ammo（开枪资源）
@@ -1294,6 +1317,7 @@
   function update(dt) {
     if (state !== 'PLAYING' || !game) return;
     playtimeAcc += dt;
+    game.timeMs = (game.timeMs || 0) + dt;
 
     // 1. 推进本地玩家（在本地玩家的场景里）
     activateScene(sceneOf(game.player));
@@ -1685,17 +1709,34 @@
         // 追击
         const dx = p.x - m.x, dy = p.y - m.y;
         const d = Math.hypot(dx, dy) || 1;
+        // 朝向：水平方向决定左右
+        if (Math.abs(dx) > 2) m.facing = dx > 0 ? 2 : 1;
+        m.walkPhase = (m.walkPhase || 0) + dt / 170;   // 更慢，拖沓的步频
         let spd = def.speed * 60;
         if (m.kind === 'fogman' && game.fogIntensity > 0.3) spd *= 1.3;
-        const nx = m.x + dx/d * spd * dt / 1000;
-        const ny = m.y + dy/d * spd * dt / 1000;
-        if (canWalkMonster(m, nx, m.y)) m.x = nx;
-        if (canWalkMonster(m, m.x, ny)) m.y = ny;
+        // 保持与玩家最小间距，避免直接重叠到玩家身上
+        const MIN_GAP = 12;
+        if (d > MIN_GAP) {
+          const nx = m.x + dx/d * spd * dt / 1000;
+          const ny = m.y + dy/d * spd * dt / 1000;
+          if (canWalkMonster(m, nx, m.y)) m.x = nx;
+          if (canWalkMonster(m, m.x, ny)) m.y = ny;
+        }
         if (d2 <= def.atkRange*def.atkRange && now - m.lastAtk > def.atkCd) {
+          // 是否新一轮扑咬：距上次攻击超过 1.2s 视为新一次"从远处扑过来"
+          const prevGap = now - (m.lastAtk || 0);
+          const newEngage = prevGap > 1200;
           m.lastAtk = now;
+          m.atkDx = dx / d; m.atkDy = dy / d;   // 记录扑咬方向
+          // 只有新一轮且玩家在远处才真正"扑"过去；已贴身则原地蹲下啃，不再跳
+          // 扑出距离 = 到玩家距离 - 间距，停在玩家前方不重叠
+          m.pouncing = (newEngage && d > 20);
+          m.atkDist = m.pouncing ? Math.max(8, Math.min(d - MIN_GAP, def.atkRange)) : 0;
           p.hp -= def.dmg;
           p.hurtFlash = 200;
           game.stats.dmgTaken += def.dmg;
+          // 在玩家位置溅出血液（地板/墙上的血迹）
+          spawnBloodSplat(p.x, p.y, sceneKeyOf(p));
         }
       } else {
         // 闲逛
@@ -1706,6 +1747,8 @@
         }
         const dx = m.wanderTx - m.x, dy = m.wanderTy - m.y;
         const d = Math.hypot(dx, dy) || 1;
+        if (Math.abs(dx) > 2) m.facing = dx > 0 ? 2 : 1;
+        if (d > 4) m.walkPhase = (m.walkPhase || 0) + dt / 120;
         const spd = def.speed * 30;
         const nx = m.x + dx/d * spd * dt / 1000;
         const ny = m.y + dy/d * spd * dt / 1000;
@@ -1831,12 +1874,55 @@
     renderToast();
   }
 
+  function spawnBloodSplat(x, y, sceneKey) {
+    if (!game) return;
+    if (!game.bloodDecals) game.bloodDecals = [];
+    // 一摊主血 + 几滴飞溅，随机偏移
+    const dec = game.bloodDecals;
+    dec.push({ x: Math.round(x), y: Math.round(y), scene: sceneKey, r: 3 + Math.random() * 2, big: true });
+    const n = 4 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < n; i++) {
+      const ang = Math.random() * Math.PI * 2;
+      const dist = 4 + Math.random() * 14;
+      dec.push({
+        x: Math.round(x + Math.cos(ang) * dist),
+        y: Math.round(y + Math.sin(ang) * dist),
+        scene: sceneKey,
+        r: 1 + Math.random() * 1.5,
+        big: false
+      });
+    }
+    // 限制总数，避免无限增长
+    if (dec.length > 240) dec.splice(0, dec.length - 240);
+  }
+
+  function renderBloodDecals() {
+    if (!game || !game.bloodDecals || !game.bloodDecals.length) return;
+    const cam = game.cam;
+    const myKey = sceneKeyOf(game.player);
+    for (const d of game.bloodDecals) {
+      if (d.scene !== myKey) continue;
+      const sx = d.x - cam.x, sy = d.y - cam.y;
+      if (sx < -8 || sy < -8 || sx > VIEW_W + 8 || sy > VIEW_H + 8) continue;
+      // 主血摊：暗红半透明圆斑；飞溅：小血滴
+      ctx.fillStyle = d.big ? 'rgba(90,10,10,0.55)' : 'rgba(110,15,15,0.6)';
+      ctx.fillRect(sx - d.r, sy - d.r, d.r * 2, d.r * 2);
+      if (d.big) {
+        // 血摊中心更深
+        ctx.fillStyle = 'rgba(60,5,5,0.5)';
+        ctx.fillRect(sx - 1, sy - 1, 2, 2);
+      }
+    }
+  }
+
   function renderWorld() {
     if (!game) return;
     // 渲染本地玩家所在场景
     activateScene(sceneOf(game.player));
     if (game.scene === 'city') renderCity();
     else renderInterior();
+    // 地板上的血迹（在怪物/玩家之下）
+    renderBloodDecals();
     // 怪物
     renderMonsters();
     // 子弹
@@ -1852,6 +1938,8 @@
     renderPlayer();
     // 雾
     if (game.fogIntensity > 0) renderFog(game.fogIntensity);
+    // 昼夜光影（最上层）
+    renderDayNight();
   }
 
   function renderCity() {
@@ -2025,45 +2113,384 @@
     ctx.fillRect(sx - 5, sy - 5, 10, 1);
   }
 
+  // 绘制单只僵尸：人形、恐怖嘴、不同衣着、腐烂、血迹，攻击时扑咬
+  function drawZombie(m, sx, sy, def) {
+    const flash = m.hurtFlash > 0;
+    const cloth = m.clothColor || '#5a3a2a';
+    const clothDark = '#2a2a2a';     // 裤子/阴影
+    const skin = flash ? '#ffffff' : def.color;
+    const skinDark = flash ? '#ffffff' : def.color2;
+    const flesh = flash ? '#ffffff' : '#7a3a3a';   // 烂肉
+    const blood = flash ? '#ffffff' : '#5a0a0a';   // 血迹
+    const bone = flash ? '#ffffff' : '#c8c0a0';    // 露骨
+    const mouth = '#2a0808';                        // 嘴腔
+    const tooth = '#e8e0c0';                        // 牙
+    const eye = def.eye;
+
+    // 扑咬动画：参考生化危机——扑出去→落地→蹲下啃食（保持，不反复伸缩）
+    const now = performance.now();
+    const atkAge = now - (m.lastAtk || 0);
+    const LUNGE_DUR = 720;   // 略大于 atkCd(700)，连续攻击间不会站起
+    const t = atkAge / LUNGE_DUR;
+    // 是否正在"扑"过来（贴身啃食时为 false，不前扑也不跳）
+    const pouncing = !!m.pouncing;
+    // fwd / lift 只在扑过来时起作用；贴身啃食时为 0
+    let fwd, lift;
+    if (pouncing) {
+      if (t < 0.30) { const k = t / 0.30; fwd = 1 - Math.pow(1 - k, 2.2); } else fwd = 1;
+      if (t < 0.35) { const leapAmt = Math.max(0, ((m.atkDist || 0) - 12)) / 26; lift = Math.sin(Math.PI * (t / 0.35)) * 7 * leapAmt; } else lift = 0;
+    } else {
+      fwd = 0; lift = 0;
+    }
+    // lean/crouch: 只在 lunging（t<1，最近攻击过）时才弯腰蹲下啃食；
+    // 动画结束（t>=1，玩家逃脱不再攻击）则回到 0 站起，头抬高。
+    // 连续攻击时 t 不会到 1（每 700ms 重置），所以保持弯腰不反复伸缩；停止攻击后才站起。
+    const lunging = t < 1;
+    let lean, crouch;
+    if (!lunging) {
+      lean = 0; crouch = 0;
+    } else if (pouncing) {
+      if (t < 0.20) { const k = t / 0.20; lean = 1 - Math.pow(1 - k, 2.2); } else lean = 1;
+      if (t < 0.35) crouch = 0;
+      else if (t < 0.45) { const k = (t - 0.35) / 0.10; crouch = 1 - Math.pow(1 - k, 2); }
+      else crouch = 1;
+    } else {
+      // 贴身啃食：保持弯腰蹲下（不伸缩）
+      lean = 1; crouch = 1;
+    }
+    // 蹲下啃食：头部快速摆动 + 嘴张合撕咬
+    const gnawActive = t > 0.42 && t < 0.80;
+    const gnaw = gnawActive ? Math.sin((t - 0.42) * 55) : 0;
+    const gnawOpen = gnawActive ? (0.5 + 0.5 * Math.sin((t - 0.42) * 55)) : 0;
+    const lungeEase = lean;   // 兼容下面用 lungeEase 的地方（弯腰/手臂/嘴）
+    const adx = m.atkDx || 0, ady = m.atkDy || 0;
+    // 扑咬方向的水平垂直分量（用于手臂向外张开）
+    const perpX = -ady, perpY = adx;
+
+    // 走路摆动：踉踉跄跄（参考植物大战僵尸）——身体和腿用同一个 phase 派生，节奏同步，不脱节
+    const phase = Number.isFinite(m.walkPhase) ? m.walkPhase : 0;
+    // 整个身体上下颠簸：每步一次（与腿同频）
+    const bob = lunging ? 0 : Math.sin(phase) * 1.4;
+    // 整个身体左右摇晃：每两步一次（phase*0.5，与腿 2:1 同步），应用到身体基点，腿和上身一起晃
+    const sway = lunging ? 0 : Math.sin(phase * 0.5) * 1.6;
+    // 步态：一前一后拖沓，幅度差（左腿大步迈、右腿拖），一瘸一拐
+    const legA = lunging ? 0 : Math.sin(phase) * 4.5;        // 左腿大步迈
+    const legB = lunging ? 0 : Math.sin(phase + 2.4) * 1.5;   // 右腿拖（幅度小、相位错开）
+    // 偶尔的踉跄前倾（每两步一次，与摇晃同频，小幅）
+    const lurch = lunging ? 0 : Math.max(0, Math.sin(phase * 0.5)) * 1.5;
+    // 头部小幅滞后摆动（与身体同频）
+    const headSway = lunging ? 0 : Math.sin(phase * 0.5 + 1.1) * 1.0;
+
+    // 整个身体腾空扑向玩家（跳跃）——向前扑出后落地停在前方
+    // 扑出距离 = 攻击时到玩家的实际距离，刚好扑到玩家位置（不乱跳）
+    const leapPx = Math.max(8, Math.min(m.atkDist || 14, 38));
+    // 侧向偏移：让多只僵尸扑到玩家周围不同位置，不重叠（嘴仍朝玩家）
+    const spread = (m.atkSpread || 0) * 9 * fwd;
+    const leapX = adx * leapPx * fwd + perpX * spread;
+    const leapY = ady * leapPx * 0.5 * fwd + perpY * spread * 0.5;
+    // 地面位置（影子落点）= 起跳后身体在地面上的投影
+    const groundX = sx + leapX;
+    const groundY = sy + leapY;
+    // 行走方向（朝玩家）——提前算好，上身前倾和腿迈步都用它，保证同步
+    let wdx = 0, wdy = 1;
+    if (game && game.player) {
+      const pdx = game.player.x - m.x, pdy = game.player.y - m.y;
+      const pd = Math.hypot(pdx, pdy) || 1;
+      wdx = pdx / pd; wdy = pdy / pd;
+    }
+    // 上身跟脚步同步前倾（以脚为轴倾斜，不是平移）：两脚交替前摆，每步一次前倾脉冲
+    // max(0,sin) 取每条腿"前摆"的半周，两腿相加 → 每步一个前倾脉冲（交替腿）
+    const stepLean = lunging ? 0 : (Math.max(0, Math.sin(phase)) + Math.max(0, Math.sin(phase + Math.PI + 0.5))) * 1.8;
+    // 身体实际绘制位置 = 地面位置往上抬 lift 像素（落地时 lift=0）；蹲下时身体往下沉
+    // 走路时整个身体基点一起左右摇晃（腿和上身一起晃，不脱节）
+    const ox = groundX + sway;
+    const oy = groundY - lift + bob + crouch * 3;
+    // 上身以腰为轴前倾（弯腰），在跳跃基础上再前倾；走路时加跟脚步同步的前倾（每步脉冲）+ 小幅踉跄
+    const LEAN_PX = 7;
+    const leanX = adx * LEAN_PX * lean + wdx * stepLean + lurch * (m.facing === 1 ? -1 : 1);
+    const leanY = ady * LEAN_PX * 0.45 * lean + wdy * stepLean * 0.5 + lurch * 0.5;
+    const tx = ox + leanX;
+    const ty = oy + leanY;
+    // 头再额外前探+下扎（咬人的点，冲在最前最下）；蹲下啃食时头更低并摆动；
+    // 走路时头跟着松散摆动 + 比上身前倾更多（以脚为轴前倾，头领先最多）
+    const headLeadX = adx * 6 * lean + wdx * stepLean * 0.9 + (lunging ? 0 : headSway);
+    const headLeadY = ady * 4 * lean + wdy * stepLean * 0.6 + (2 + crouch * 4) * lean + gnaw * 1.5;
+
+    // ---- 扑咬运动残影（仅在向前扑的阶段 t<0.45 显示，身后拖尾）----
+    if (t < 0.45 && fwd > 0.05) {
+      const streaks = 3;
+      for (let i = 1; i <= streaks; i++) {
+        const k = (i / streaks) * fwd;
+        ctx.fillStyle = `rgba(90,122,58,${0.16 * k})`;
+        ctx.fillRect(tx - adx * i * 5 - 4, ty - ady * i * 3 - 5, 8, 10);
+      }
+    }
+
+    // ---- 腾空影子（留在地面 groundX,groundY，身体被抬到影子上方，体现"跳起来"）----
+    if (lift > 0.05) {
+      ctx.fillStyle = `rgba(0,0,0,${0.30 * (lift / 7)})`;
+      const sw = 10 - 4 * (lift / 7);   // 跳得越高影子越小越淡
+      ctx.fillRect(groundX - sw / 2, groundY + 5, sw, 3);
+    }
+
+    // ---- 腿 ----
+    ctx.fillStyle = clothDark;
+    if (lift > 0.05) {
+      // 腾空时双腿蜷起（屈膝前收），不是直直踩在地上
+      const tuck = 3 * (lift / 7);
+      ctx.fillRect(ox - 4, oy + 2, 3, 7 - tuck);   // 左腿屈起
+      ctx.fillRect(ox + 1, oy + 2, 3, 7 - tuck);   // 右腿屈起
+      // 脚（深色鞋）
+      ctx.fillStyle = '#1a1a1a';
+      ctx.fillRect(ox - 5, oy + 8 - tuck, 4, 2);
+      ctx.fillRect(ox + 1, oy + 8 - tuck, 4, 2);
+    } else if (crouch > 0.05) {
+      // 蹲下啃食：双腿屈膝外撇（蹲姿），身体压低
+      const bend = crouch * 2;
+      ctx.fillStyle = clothDark;
+      ctx.fillRect(ox - 5, oy + 2, 3, 7 - bend);   // 左腿屈膝外撇
+      ctx.fillRect(ox + 2, oy + 2, 3, 7 - bend);   // 右腿屈膝外撇
+      // 脚
+      ctx.fillStyle = '#1a1a1a';
+      ctx.fillRect(ox - 6, oy + 8 - bend, 4, 2);
+      ctx.fillRect(ox + 2, oy + 8 - bend, 4, 2);
+    } else if (lunging) {
+      // 落地后双腿落地支撑（已停在前方）
+      ctx.fillRect(ox - 4, oy + 2, 3, 7);
+      ctx.fillRect(ox + 1, oy + 2, 3, 7);
+      ctx.fillStyle = '#1a1a1a';
+      ctx.fillRect(ox - 5, oy + 8, 4, 2);
+      ctx.fillRect(ox + 1, oy + 8, 4, 2);
+    } else {
+      // 走路：关节式骨骼步态（髋→膝→脚，大腿+小腿两段，真实步态周期），再叠加僵尸拖沓
+      // 行走方向 wdx,wdy 已在上面算好（上身前倾和腿迈步共用，保证同步）
+      // 画一段骨骼（2px 粗，沿连线步进）
+      const drawSeg = (x0, y0, x1, y1) => {
+        const steps = 6;
+        for (let i = 0; i <= steps; i++) {
+          const k = i / steps;
+          ctx.fillRect(Math.round(x0 + (x1 - x0) * k) - 1, Math.round(y0 + (y1 - y0) * k), 2, 1);
+        }
+      };
+      // 画一条带关节的腿（大腿+小腿），沿行走方向迈步
+      // lp: 该腿相位；drag: 拖沓系数（1=正常，<1=拖腿）
+      const drawJointedLeg = (hipX, hipY, lp, drag) => {
+        const thighLen = 4, shinLen = 5;
+        const swing = Math.sin(lp) * drag;            // 大腿前后摆（沿行走方向），-1..1
+        const kneeBend = Math.max(0, Math.sin(lp + 1.1)) * 2.0 * drag;  // 膝盖弯曲（摆动相抬腿时弯曲）
+        // 大腿向量：主要向下，沿行走方向大幅前后摆（让后脚能迈到前脚前面）
+        const thighDx = wdx * swing * 4.5;
+        const thighDy = thighLen;
+        const kneeX = hipX + thighDx;
+        const kneeY = hipY + thighDy;
+        // 小腿向量：从膝盖向下，膝盖弯曲时小腿往后收（抬脚）；前摆时小腿往前伸（迈出去）
+        const shinDx = wdx * swing * 2.5 - wdx * kneeBend * 0.6;
+        const shinDy = shinLen - kneeBend * 0.4;
+        const footX = kneeX + shinDx;
+        const footY = kneeY + shinDy;
+        // 画大腿（髋→膝）
+        ctx.fillStyle = clothDark;
+        drawSeg(hipX, hipY, kneeX, kneeY);
+        // 画小腿（膝→脚）
+        drawSeg(kneeX, kneeY, footX, footY);
+        // 膝盖关节点
+        ctx.fillStyle = skinDark;
+        ctx.fillRect(Math.round(kneeX) - 1, Math.round(kneeY), 2, 1);
+        // 脚（深色鞋）
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fillRect(Math.round(footX) - 2, Math.round(footY), 4, 2);
+        return { footX, footY };
+      };
+      // 左腿：正常迈步（相位 phase）；右腿：僵尸拖腿（相位错开 + 拖沓系数小，一瘸一拐）
+      const lFoot = drawJointedLeg(ox - 2, oy + 2, phase, 1.0);
+      const rFoot = drawJointedLeg(ox + 2, oy + 2, phase + Math.PI + 0.5, 0.55);
+      // 右腿腐烂露骨（膝盖处）
+      ctx.fillStyle = bone;
+      ctx.fillRect(Math.round(ox + 2 + wdx * Math.sin(phase + Math.PI + 0.5) * 2.0) - 1, Math.round(oy + 2 + 4), 1, 1);
+      // 脚边血迹（右脚拖过的痕迹）
+      ctx.fillStyle = blood;
+      ctx.fillRect(Math.round(rFoot.footX) - 2, Math.round(rFoot.footY) + 2, 4, 1);
+    }
+
+    // ---- 身体（衣着）—— 用上身基准 tx,ty（以腰为轴前倾）----
+    ctx.fillStyle = cloth;
+    ctx.fillRect(tx - 4, ty - 4, 8, 7);
+    // 衣服下摆阴影
+    ctx.fillStyle = skinDark;
+    ctx.fillRect(tx - 4, ty + 1, 8, 2);
+    // 腐烂露肉块
+    ctx.fillStyle = flesh;
+    ctx.fillRect(tx - 2, ty - 2, 3, 2);
+    ctx.fillRect(tx + 2, ty + 1, 2, 2);
+    // 血迹泼洒
+    ctx.fillStyle = blood;
+    ctx.fillRect(tx - 3, ty - 1, 3, 2);
+    ctx.fillRect(tx + 1, ty + 2, 3, 1);
+    ctx.fillRect(tx - 1, ty - 3, 1, 1);
+    // 露出的肋骨
+    ctx.fillStyle = bone;
+    ctx.fillRect(tx - 1, ty - 3, 1, 3);
+    ctx.fillRect(tx + 1, ty - 2, 1, 2);
+
+    // ---- 手臂 ----
+    ctx.fillStyle = skin;
+    if (lunging) {
+      // 扑咬：双臂沿扑咬方向前伸但向外张开（拥抱式抓取，不是出拳）
+      // 头部才是咬人的主力，手臂只是抓
+      const shY = ty - 2;   // 肩膀在躯干上部（脖子下方），手臂从躯干伸出，不是从头
+      const reach = 2.5 + 1.2 * lungeEase;   // 手臂前伸很短，绝不超过头部前探距离，头始终冲在最前
+      const drawGrabArm = (shoulderX, spreadSign) => {
+        // 沿扑咬方向前伸，同时沿垂直方向向外张开（spreadSign = ±1）
+        const dx = adx * reach + perpX * spreadSign * 1.2;
+        const dy = ady * reach + perpY * spreadSign * 1.2;
+        // 上臂（肩→肘）
+        const ex = Math.round(shoulderX + dx * 0.5);
+        const ey = Math.round(shY + dy * 0.5);
+        ctx.fillRect(shoulderX, shY, 2, 2);
+        ctx.fillRect(ex, ey, 2, 2);
+        // 前臂（肘→爪）
+        const hx = Math.round(shoulderX + dx);
+        const hy = Math.round(shY + dy);
+        ctx.fillRect(hx, hy, 2, 2);
+        // 张开的爪（露骨，3 根指呈扇形）
+        ctx.fillStyle = bone;
+        ctx.fillRect(hx - 1, hy, 1, 1);
+        ctx.fillRect(hx + 2, hy, 1, 1);
+        ctx.fillRect(hx, hy + (ady >= 0 ? 2 : -1), 1, 1);
+        ctx.fillStyle = skin;
+      };
+      drawGrabArm(tx - 3, -1);   // 左臂向左张
+      drawGrabArm(tx + 1, 1);    // 右臂向右张
+    } else {
+      // 平时双臂垂下、略前伸（僵尸姿态）——从躯干两侧伸出，不在头部
+      ctx.fillRect(tx - 5, ty - 1, 2, 5);
+      ctx.fillRect(tx + 3, ty - 1, 2, 5);
+      // 一只手露骨
+      ctx.fillStyle = bone;
+      ctx.fillRect(tx - 5, ty + 3, 2, 1);
+      ctx.fillRect(tx + 3, ty + 3, 2, 1);
+    }
+
+    // ---- 头（扑咬时头部冲到最前最下，是咬人的主力）----
+    // 头抬高一点，留出脖子，让头/身/腿层次清晰
+    const hx = tx + headLeadX, hy = ty - 11 + headLeadY;
+    // 脖子（连接头和身体，加粗让头身分离明显）
+    ctx.fillStyle = skinDark;
+    ctx.fillRect(tx - 2, ty - 6, 4, 3);
+    // 下巴阴影（头底下一条暗线，强化头身分界）
+    ctx.fillStyle = '#000';
+    ctx.fillRect(tx - 3, ty - 6, 6, 1);
+    // 头部朝向：以扑咬方向为准，五官画在朝玩家那一侧
+    let faceDir;
+    if (Math.abs(adx) >= Math.abs(ady)) faceDir = adx >= 0 ? 'right' : 'left';
+    else faceDir = ady >= 0 ? 'down' : 'up';
+    if (!lunging && !gnawActive) faceDir = 'down';  // 平时朝下
+    const openAmt = gnawActive ? gnawOpen : (lunging ? 1 : 0.3);
+    const mh = 1 + Math.round(openAmt * 2);   // 嘴张开度 1→3
+
+    ctx.fillStyle = skin;
+    ctx.fillRect(hx - 3, hy, 6, 5);
+    // 头部腐烂斑
+    ctx.fillStyle = flesh;
+    ctx.fillRect(hx - 2, hy + 1, 2, 1);
+    ctx.fillRect(hx + 1, hy + 3, 2, 1);
+    // 稀疏头发（画在头顶，即脸的反方向）
+    ctx.fillStyle = '#1a1a1a';
+    if (faceDir === 'down') { ctx.fillRect(hx-3,hy,2,1); ctx.fillRect(hx+1,hy,2,1); }
+    else if (faceDir === 'up') { ctx.fillRect(hx-3,hy+4,2,1); ctx.fillRect(hx+1,hy+4,2,1); }
+    else if (faceDir === 'right') { ctx.fillRect(hx-3,hy,1,2); ctx.fillRect(hx-3,hy+3,1,2); }
+    else { ctx.fillRect(hx+2,hy,1,2); ctx.fillRect(hx+2,hy+3,1,2); }
+
+    // 眼睛（恐怖红）+ 眼眶暗影，按朝向放置
+    ctx.fillStyle = '#000';
+    if (faceDir === 'down' || faceDir === 'up') {
+      ctx.fillRect(hx - 2, hy + 1, 1, 2);
+      ctx.fillRect(hx + 1, hy + 1, 1, 2);
+      ctx.fillStyle = eye;
+      ctx.fillRect(hx - 2, hy + 2, 1, 1);
+      ctx.fillRect(hx + 1, hy + 2, 1, 1);
+    } else {
+      ctx.fillRect(hx - 2, hy + 1, 2, 1);
+      ctx.fillRect(hx - 2, hy + 3, 2, 1);
+      ctx.fillStyle = eye;
+      ctx.fillRect(hx - 1, hy + 1, 1, 1);
+      ctx.fillRect(hx - 1, hy + 3, 1, 1);
+    }
+
+    // ---- 嘴（恐怖，按朝向画在朝玩家那一侧）----
+    // 嘴腔 + 牙 + 獠牙 + 溅血，方向由 faceDir 决定
+    if (faceDir === 'down') {
+      ctx.fillStyle = mouth;
+      ctx.fillRect(hx - 3, hy + 4, 6, mh);
+      ctx.fillStyle = tooth;
+      ctx.fillRect(hx - 3, hy + 4, 1, 1); ctx.fillRect(hx - 1, hy + 4, 1, 1);
+      ctx.fillRect(hx + 1, hy + 4, 1, 1); ctx.fillRect(hx + 2, hy + 4, 1, 1);
+      if (mh >= 2) { ctx.fillRect(hx-2,hy+4+mh-1,1,1); ctx.fillRect(hx,hy+4+mh-1,1,1); ctx.fillRect(hx+1,hy+4+mh-1,1,1); }
+      ctx.fillStyle = bone; ctx.fillRect(hx-2,hy+5,1,1); ctx.fillRect(hx+2,hy+5,1,1);
+      if (lunging||gnawActive){ctx.fillStyle=blood;ctx.fillRect(hx-3,hy+4+mh,1,1);ctx.fillRect(hx+3,hy+4+mh,1,1);ctx.fillRect(hx-1,hy+5+mh,2,1);}
+    } else if (faceDir === 'up') {
+      ctx.fillStyle = mouth;
+      ctx.fillRect(hx - 3, hy, 6, mh);
+      ctx.fillStyle = tooth;
+      ctx.fillRect(hx - 3, hy + mh - 1, 1, 1); ctx.fillRect(hx - 1, hy + mh - 1, 1, 1);
+      ctx.fillRect(hx + 1, hy + mh - 1, 1, 1); ctx.fillRect(hx + 2, hy + mh - 1, 1, 1);
+      if (mh >= 2) { ctx.fillRect(hx-2,hy,1,1); ctx.fillRect(hx,hy,1,1); ctx.fillRect(hx+1,hy,1,1); }
+      ctx.fillStyle = bone; ctx.fillRect(hx-2,hy+1,1,1); ctx.fillRect(hx+2,hy+1,1,1);
+      if (lunging||gnawActive){ctx.fillStyle=blood;ctx.fillRect(hx-3,hy-1,1,1);ctx.fillRect(hx+3,hy-1,1,1);ctx.fillRect(hx-1,hy-1,2,1);}
+    } else if (faceDir === 'right') {
+      // 嘴在头右侧（朝玩家），竖向嘴
+      ctx.fillStyle = mouth;
+      ctx.fillRect(hx + 3 - mh, hy + 1, mh, 3);
+      ctx.fillStyle = tooth;
+      ctx.fillRect(hx + 2, hy + 1, 1, 1); ctx.fillRect(hx + 2, hy + 3, 1, 1);
+      if (mh >= 2) { ctx.fillRect(hx+3-mh,hy+1,1,1); ctx.fillRect(hx+3-mh,hy+3,1,1); }
+      ctx.fillStyle = bone; ctx.fillRect(hx + 2, hy + 2, 1, 1);
+      if (lunging||gnawActive){ctx.fillStyle=blood;ctx.fillRect(hx+3,hy+1,1,1);ctx.fillRect(hx+3,hy+3,1,1);ctx.fillRect(hx+4,hy+2,1,1);}
+    } else { // left
+      ctx.fillStyle = mouth;
+      ctx.fillRect(hx - 3, hy + 1, mh, 3);
+      ctx.fillStyle = tooth;
+      ctx.fillRect(hx - 3, hy + 1, 1, 1); ctx.fillRect(hx - 3, hy + 3, 1, 1);
+      if (mh >= 2) { ctx.fillRect(hx-3+mh-1,hy+1,1,1); ctx.fillRect(hx-3+mh-1,hy+3,1,1); }
+      ctx.fillStyle = bone; ctx.fillRect(hx - 3, hy + 2, 1, 1);
+      if (lunging||gnawActive){ctx.fillStyle=blood;ctx.fillRect(hx-4,hy+1,1,1);ctx.fillRect(hx-4,hy+3,1,1);ctx.fillRect(hx-5,hy+2,1,1);}
+    }
+  }
+
   function renderMonsters() {
     const cam = game.cam;
     for (const m of currentMonsters()) {
       if (!m.alive) continue;
       const sx = m.x - cam.x, sy = m.y - cam.y;
-      if (sx < -20 || sx > VIEW_W + 20 || sy < -20 || sy > VIEW_H + 20) continue;
+      if (sx < -24 || sx > VIEW_W + 24 || sy < -24 || sy > VIEW_H + 24) continue;
       const def = MON[m.kind];
       // 阴影
       ctx.fillStyle = 'rgba(0,0,0,0.45)';
       ctx.fillRect(sx - 5, sy + 5, 10, 2);
-      // 身体（8x10）
-      const flash = m.hurtFlash > 0;
-      ctx.fillStyle = flash ? '#ffffff' : def.color;
-      ctx.fillRect(sx - 4, sy - 5, 8, 10);
-      ctx.fillStyle = flash ? '#ffffff' : def.color2;
-      ctx.fillRect(sx - 4, sy + 1, 8, 4);
-      // 头
-      ctx.fillStyle = flash ? '#ffffff' : def.color;
-      ctx.fillRect(sx - 3, sy - 8, 6, 4);
-      // 眼睛
-      ctx.fillStyle = def.eye;
-      if (m.kind === 'fogman') {
+      if (m.kind === 'zombie') {
+        drawZombie(m, sx, sy, def);
+      } else {
+        // 雾中人：保持原有简洁造型
+        const flash = m.hurtFlash > 0;
+        ctx.fillStyle = flash ? '#ffffff' : def.color;
+        ctx.fillRect(sx - 4, sy - 5, 8, 10);
+        ctx.fillStyle = flash ? '#ffffff' : def.color2;
+        ctx.fillRect(sx - 4, sy + 1, 8, 4);
+        ctx.fillStyle = flash ? '#ffffff' : def.color;
+        ctx.fillRect(sx - 3, sy - 8, 6, 4);
+        ctx.fillStyle = def.eye;
         ctx.fillRect(sx - 2, sy - 7, 1, 2);
         ctx.fillRect(sx + 1, sy - 7, 1, 2);
-      } else {
-        ctx.fillRect(sx - 2, sy - 6, 2, 1);
-        ctx.fillRect(sx + 1, sy - 6, 2, 1);
-      }
-      // 雾中人周围雾
-      if (m.kind === 'fogman') {
+        // 雾中人周围雾
         ctx.fillStyle = 'rgba(180,190,210,0.18)';
         ctx.fillRect(sx - 10, sy - 12, 20, 22);
       }
       // 血条
       if (m.hp < m.maxHp) {
         ctx.fillStyle = '#000';
-        ctx.fillRect(sx - 5, sy - 12, 10, 2);
+        ctx.fillRect(sx - 5, sy - 14, 10, 2);
         ctx.fillStyle = PAL.danger;
-        ctx.fillRect(sx - 5, sy - 12, Math.ceil(10 * m.hp / m.maxHp), 2);
+        ctx.fillRect(sx - 5, sy - 14, Math.ceil(10 * m.hp / m.maxHp), 2);
       }
     }
   }
@@ -2170,6 +2597,66 @@
     }
   }
 
+  // ---------- 昼夜循环 ----------
+  // 10 分钟一轮：约 5 分钟白天 + 5 分钟夜晚，中间 20 秒过渡。仅影响视觉，不影响刷怪。
+  const DAY_CYCLE_MS = 600000;
+  const DAWN_LEN = 0.033;    // 黎明占周期的 3.3%（约 20s）
+  const DUSK_START = 0.5;    // 黄昏从周期一半开始
+  const DUSK_LEN = 0.033;    // 黄昏占 3.3%
+  function getDarkness() {
+    if (!game || game.timeMs == null) return 0;
+    const t = (game.timeMs % DAY_CYCLE_MS) / DAY_CYCLE_MS;
+    if (t < DAWN_LEN) return 1 - t / DAWN_LEN;                 // 黎明：1 -> 0
+    if (t < DUSK_START) return 0;                              // 白天
+    if (t < DUSK_START + DUSK_LEN) return (t - DUSK_START) / DUSK_LEN; // 黄昏：0 -> 1
+    return 1;                                                   // 夜晚
+  }
+  // 当前时段名（用于 HUD）
+  function timeOfDayLabel() {
+    const d = getDarkness();
+    if (d <= 0.05) return '白天';
+    if (d >= 0.95) return '夜晚';
+    return d < 0.5 ? '黄昏' : '黎明';
+  }
+
+  function renderDayNight() {
+    const darkness = getDarkness();
+    if (darkness <= 0.01) {
+      // 白天：暖色阳光，从顶部洒下的柔光，整体明亮好看
+      const sun = ctx.createRadialGradient(VIEW_W * 0.5, -30, 30, VIEW_W * 0.5, -30, 420);
+      sun.addColorStop(0, 'rgba(255,236,170,0.12)');
+      sun.addColorStop(1, 'rgba(255,236,170,0)');
+      ctx.fillStyle = sun;
+      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+      // 极淡的暖色调
+      ctx.fillStyle = 'rgba(255,246,214,0.03)';
+      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+      return;
+    }
+    // 夜晚：冷色暗调 + 暗角 + 微红血月 + 轻微闪烁（恐怖感，但不太暗）
+    const now = performance.now();
+    const flicker = 0.92 + 0.05 * Math.sin(now / 130) + 0.03 * Math.sin(now / 47);
+    // 基础暗蓝叠加（室内稍弱，有灯光）
+    const indoorDamp = (game.scene === 'interior') ? 0.7 : 1;
+    const baseA = 0.34 * darkness * indoorDamp;
+    ctx.fillStyle = `rgba(8,10,30,${baseA})`;
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    // 暗角 vignette
+    const vg = ctx.createRadialGradient(VIEW_W / 2, VIEW_H / 2, 70, VIEW_W / 2, VIEW_H / 2, 380);
+    vg.addColorStop(0, 'rgba(0,0,0,0)');
+    vg.addColorStop(1, `rgba(0,0,10,${0.5 * darkness * flicker})`);
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    // 血月微红（夜晚越深越明显）
+    ctx.fillStyle = `rgba(50,0,4,${0.10 * darkness})`;
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    // 远处偶发"闪电"白光（极低概率，恐怖惊吓）
+    if (Math.random() < 0.0015) {
+      ctx.fillStyle = 'rgba(220,220,255,0.18)';
+      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    }
+  }
+
   // ---------- HUD ----------
   function renderHUD() {
     const p = game.player;
@@ -2222,21 +2709,28 @@
                       + ' F' + (game.curFloor+1);
     ctx.fillText(sceneName, 240, 14);
 
+    // 时段（白天/夜晚）
+    const tod = timeOfDayLabel();
+    const isNight = getDarkness() > 0.5;
+    ctx.fillStyle = isNight ? '#9ab0ff' : '#ffd070';
+    ctx.font = 'bold 10px Consolas, monospace';
+    ctx.fillText((isNight ? '🌙 ' : '☀ ') + tod, 330, 14);
+
     // 击杀
     ctx.fillStyle = PAL.uiDim;
-    ctx.fillText('击杀 ' + (game.stats.kills || 0), 360, 14);
+    ctx.fillText('击杀 ' + (game.stats.kills || 0), 400, 14);
 
     // 子弹（醒目显示，因为它是远程武器资源）
     const ammo = game.player.ammo || 0;
     ctx.fillStyle = ammo > 0 ? '#ffe070' : PAL.uiDim;
     ctx.font = 'bold 11px Consolas, monospace';
-    ctx.fillText(devMode ? '子弹 ∞  [K 开枪]' : ('子弹 x' + ammo + '  [K 开枪]'), 440, 14);
+    ctx.fillText(devMode ? '子弹 ∞  [K 开枪]' : ('子弹 x' + ammo + '  [K 开枪]'), 475, 14);
 
     // 开发者模式标识（不显示按键）
     if (devMode) {
       ctx.fillStyle = '#ff6060';
       ctx.font = 'bold 10px Consolas, monospace';
-      ctx.fillText('[ 开发者模式 ]', 560, 14);
+      ctx.fillText('[ 开发者模式 ]', 595, 14);
     }
 
     // 物品栏（底部）
