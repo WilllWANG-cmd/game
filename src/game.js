@@ -26,9 +26,20 @@
     if (anyDialogOpen()) { return; }
     if (e.code === 'F3') { party.debugHud = !party.debugHud; e.preventDefault(); return; }
     // F12 由主进程拦截并通过 dev:toggle IPC 通知，这里不再处理
-    if (!keys[e.code]) keyPressed[e.code] = true;
+    const firstPress = !keys[e.code];
+    if (firstPress) keyPressed[e.code] = true;
     keys[e.code] = true;
     if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+    // 客户端边沿输入缓冲：interact / useItem 是"按一次"的边沿触发，
+    // 但 keyPressed 每帧被清空、clientTick 每 33ms 才发一次，会丢按键。
+    // 只在首次按下时写缓冲（排除按键自动重复），clientTick 发送时再读走并清空。
+    if (firstPress && state === 'PLAYING' && game && game.netMode === 'client') {
+      if (e.code === 'KeyE' || e.code === 'KeyF') party._edgeInteract = true;
+      else if (e.code === 'Digit1') party._edgeUseItem = 'medkit';
+      else if (e.code === 'Digit2') party._edgeUseItem = 'bandage';
+      else if (e.code === 'Digit3') party._edgeUseItem = 'canned';
+      else if (e.code === 'Digit4') party._edgeUseItem = 'water';
+    }
   });
   window.addEventListener('keyup', (e) => {
     if (anyDialogOpen()) return;
@@ -412,7 +423,11 @@
     discoverTimer: 0,
     broadcastAcc: 0,       // 主机广播累计
     inputSendAcc: 0,       // 客户端发送输入累计
-    lastSentSceneKey: null // 用于只在场景变化时发送地图
+    lastSentSceneKey: null, // 用于只在场景变化时发送地图
+    // 客户端边沿输入缓冲：keydown 写入，clientTick 发送后清空。
+    // 避免 keyPressed 每帧被清空、而 clientTick 每 33ms 才发一次导致的边沿按键丢失。
+    _edgeInteract: false,
+    _edgeUseItem: null
   };
   let joinPending = false;
   let hostNamePending = false;
@@ -532,11 +547,12 @@
         break;
       case 'client-join':
         if (party.role === 'host') {
-          // 游戏进行中：为新加入的客户端建立 avatar，放到城市出生点
+          // 游戏进行中：为新加入的客户端建立 avatar，放到城市出生点。
+          // 注意：client-join 事件在 lobby 事件之前到达，此时 party.lobbyPlayers 还没更新，
+          // 所以必须用 evt 自带的 id/name，不能去 lobbyPlayers 里查（否则查不到，avatar 不会建）。
           if (game && game.netMode === 'host') {
-            const lp = (party.lobbyPlayers || []).find(x => x.id === evt.id);
-            if (lp && !game.remotePlayers.some(r => r.id === lp.id)) {
-              const rp = makePlayerEntity(lp.name, lp.id, false);
+            if (!game.remotePlayers.some(r => r.id === evt.id)) {
+              const rp = makePlayerEntity(evt.name || ('玩家' + evt.id), evt.id, false);
               rp.scene = 'city'; rp.curBuilding = null; rp.curFloor = 0;
               const home = game.city.buildings.find(b => b.isHome) || game.city.buildings[0];
               const cityBundle = ensureCityScene();
@@ -545,6 +561,17 @@
               game.remotePlayers.push(rp);
               syncBundle(cityBundle);
               activateScene(sceneOf(game.player));
+              // 关键：游戏已开始时，主机不会再次广播 start，必须单独补发给迟到客户端，
+              // 否则客户端永远停在 CLIENT_LOBBY，不发输入（表现为联机卡住、avatar 站在出生点不动）。
+              if (window.api && window.api.partyHostSendTo) {
+                window.api.partyHostSendTo(evt.id, {
+                  type: 'start',
+                  seed: game.seed,
+                  yourId: evt.id,
+                  hostName: party.myName || '主机',
+                  players: party.lobbyPlayers
+                });
+              }
             }
           }
         }
@@ -667,6 +694,7 @@
 
   // ---------- 主机：广播快照（按客户端所在场景定向发送） ----------
   function overviewOf(p, isHost) {
+    const now = performance.now();
     return {
       id: p.id || 0, name: p.name, isHost,
       x: Math.round(p.x), y: Math.round(p.y),
@@ -676,12 +704,16 @@
       ammo: p.ammo || 0, inv: p.inv || {},
       scene: p.scene || 'city',
       curBuildingId: p.curBuilding ? p.curBuilding.id : null,
-      curFloor: p.curFloor || 0
+      curFloor: p.curFloor || 0,
+      // 攻击/开枪的"距今毫秒数"，用相对时间避免主客机 performance.now() 时钟不一致。
+      // 客户端据此还原 lastAtk/lastShoot，让自己能看到挥拳/开火动画。
+      atkAge: p.lastAtk ? Math.min(9999, now - p.lastAtk) : 9999,
+      shootAge: p.lastShoot ? Math.min(9999, now - p.lastShoot) : 9999
     };
   }
   function maybeBroadcastSnapshot() {
     party.broadcastAcc += 16; // 近似帧时间
-    if (party.broadcastAcc < 60) return; // ~16 次/秒
+    if (party.broadcastAcc < 50) return; // ~20 次/秒（配合客户端插值，远程玩家更顺滑）
     party.broadcastAcc = 0;
     if (!game || game.netMode !== 'host') return;
 
@@ -830,29 +862,42 @@
     const players = s.players || [];
     const me = players.find(p => p.id === meId);
     if (me) {
-      game.player.x = me.x; game.player.y = me.y;
+      // 服务器权威：血量/物品/弹药/场景归属/受击闪烁/瞄准/攻击动画都以快照为准
       game.player.hp = me.hp; game.player.maxHp = me.maxHp;
-      game.player.facing = me.facing;
-      game.player.walkPhase = me.walkPhase;
       game.player.hurtFlash = me.hurtFlash;
       game.player.ammo = me.ammo;
       game.player.inv = me.inv || {};
       game.player.lastAim = { dx: me.aimDx, dy: me.aimDy };
       game.player.name = me.name;
+      // 用快照里的相对 age 还原本机 lastAtk/lastShoot，让客户端能看到自己挥拳/开火的动画
+      const cnow = performance.now();
+      game.player.lastAtk = (me.atkAge != null && me.atkAge < 9999) ? (cnow - me.atkAge) : 0;
+      game.player.lastShoot = (me.shootAge != null && me.shootAge < 9999) ? (cnow - me.shootAge) : 0;
       // 场景归属（用于 HUD/同场景渲染判断）
       game.player.scene = me.scene || 'city';
       game.player.curFloor = me.curFloor || 0;
       game.player.curBuilding = me.curBuildingId != null
         ? (game.city.buildings.find(b => b.id === me.curBuildingId) || { id: me.curBuildingId, kind: s.curBuildingKind, isHome: s.curBuildingIsHome, floors: s.curBuildingFloors, cleared: {} })
         : null;
+      // 位置纠错：本地预测 vs 服务器。偏差小（<1 格）就保留预测位置（更跟手、不抖）；
+      // 偏差大（被僵尸击退、碰撞不一致等）才以服务器为准瞬移纠正。facing/walkPhase 保留本地预测值。
+      const drift = Math.hypot(me.x - game.player.x, me.y - game.player.y);
+      if (drift > 16) { game.player.x = me.x; game.player.y = me.y; }
     }
     game.remotePlayers = players.filter(p => p.id !== meId).map(p => {
       const cb = p.curBuildingId != null
         ? (game.city.buildings.find(b => b.id === p.curBuildingId) || { id: p.curBuildingId, kind: null, isHome: false, floors: 0, cleared: {} })
         : null;
+      // 远程玩家：把快照位置存成插值目标 _tx/_ty，x/y 保留当前值，
+      // 由 clientTick 每帧 lerp 追过去，避免 16Hz 快照造成的瞬移抖动。
+      // 场景切换时（进/出建筑）坐标系变了，直接 snap 到新位置，不插值。
+      const old = (game.remotePlayers || []).find(r => r.id === p.id);
+      const sceneChanged = !old || old.scene !== (p.scene || 'city');
       return {
         id: p.id, name: p.name, isHost: p.isHost,
-        x: p.x, y: p.y, hp: p.hp, maxHp: p.maxHp,
+        x: sceneChanged ? p.x : old.x, y: sceneChanged ? p.y : old.y,
+        _tx: p.x, _ty: p.y,
+        hp: p.hp, maxHp: p.maxHp,
         facing: p.facing, walkPhase: p.walkPhase, hurtFlash: p.hurtFlash,
         ammo: p.ammo, inv: p.inv || {}, lastAim: { dx: p.aimDx, dy: p.aimDy },
         scene: p.scene || 'city', curBuilding: cb, curFloor: p.curFloor || 0
@@ -863,20 +908,55 @@
     updateCamera();
   }
 
-  // ---------- 客户端：发送输入 ----------
+  // ---------- 客户端：本地预测 + 发送输入 ----------
+  // 客户端比主机卡的根本原因：客户端自己不模拟移动，只能等"按键→发包→主机模拟→快照回传"这一整个往返
+  // 才看到自己动，输入延迟 ≈ 33ms(发包) + 62ms(快照) + 网络 RTT，明显比主机顿。
+  // 解决：客户端本地立即预测自己的移动（碰撞用本机地图，和主机一致），快照回来只做纠错。
   function clientTick(dt) {
     if (!game || game.netMode !== 'client') return;
     game.timeMs = (game.timeMs || 0) + dt;
+
+    // 1) 本地预测：每帧立即应用自己的移动输入，跟手不等网络
+    const inp = readLocalInput();
+    stepClientLocalPrediction(inp, dt);
+
+    // 2) 远程玩家位置插值：把快照设的目标位置平滑追过去，避免 16Hz 快照造成的瞬移抖动
+    for (const rp of (game.remotePlayers || [])) {
+      if (rp._tx == null) continue;
+      const lerp = Math.min(1, dt / 80); // ~80ms 追上目标
+      rp.x += (rp._tx - rp.x) * lerp;
+      rp.y += (rp._ty - rp.y) * lerp;
+    }
+    updateCamera();
+
+    // 3) 发送输入 ~30Hz
     party.inputSendAcc += dt;
-    // 发送输入 ~30Hz
     if (party.inputSendAcc < 33) { keyPressed = {}; return; }
     party.inputSendAcc = 0;
-    const inp = readLocalInput();
     inp.name = party.myName;
     party._lastSentMv = { mx: inp.mx, my: inp.my };
     party._sentInputs = (party._sentInputs || 0) + 1;
     window.api.partySend({ type: 'input', mx: inp.mx, my: inp.my, aimDx: inp.aimDx, aimDy: inp.aimDy, attack: inp.attack, shoot: inp.shoot, interact: inp.interact, useItem: inp.useItem });
+    // 边沿输入已发出，清空缓冲，避免下一包重复触发 interact / useItem
+    party._edgeInteract = false;
+    party._edgeUseItem = null;
     keyPressed = {};
+  }
+
+  // 客户端本地移动预测：只预测移动 + 朝向 + 步频（攻击/开枪/互动仍由主机权威结算）
+  function stepClientLocalPrediction(input, dt) {
+    const speed = 90;
+    const nx = game.player.x + input.mx * speed * dt / 1000;
+    const ny = game.player.y + input.my * speed * dt / 1000;
+    if (canWalk(nx, game.player.y)) game.player.x = nx;
+    if (canWalk(game.player.x, ny)) game.player.y = ny;
+    if (input.attack || input.shoot) {
+      game.player.facing = cardinalFromDir(input.aimDx, input.aimDy);
+    } else if (input.mx < 0) game.player.facing = 1;
+    else if (input.mx > 0) game.player.facing = 2;
+    else if (input.my < 0) game.player.facing = 3;
+    else if (input.my > 0) game.player.facing = 0;
+    if (input.mx !== 0 || input.my !== 0) game.player.walkPhase = (game.player.walkPhase || 0) + dt / 100;
   }
 
   // 新建对局
@@ -1259,17 +1339,23 @@
     if (keys['ArrowDown'] || keys['KeyS']) my += 1;
     if (mx !== 0 && my !== 0) { mx *= 0.7071; my *= 0.7071; }
     const aim = aimDir();
+    const isClient = !!(game && game.netMode === 'client');
+    // 客户端用边沿缓冲（keydown 写入，clientTick 发送时清空），主机/单机用 keyPressed（每帧读）
     let useItem = null;
-    if (keyPressed['Digit1']) useItem = 'medkit';
-    else if (keyPressed['Digit2']) useItem = 'bandage';
-    else if (keyPressed['Digit3']) useItem = 'canned';
-    else if (keyPressed['Digit4']) useItem = 'water';
+    if (isClient) {
+      useItem = party._edgeUseItem || null;
+    } else {
+      if (keyPressed['Digit1']) useItem = 'medkit';
+      else if (keyPressed['Digit2']) useItem = 'bandage';
+      else if (keyPressed['Digit3']) useItem = 'canned';
+      else if (keyPressed['Digit4']) useItem = 'water';
+    }
     return {
       mx, my,
       aimDx: aim.dx, aimDy: aim.dy,
       attack: !!(keys['Space'] || keys['KeyJ']),
       shoot: !!keys['KeyK'],
-      interact: !!(keyPressed['KeyE'] || keyPressed['KeyF']),
+      interact: isClient ? !!party._edgeInteract : !!(keyPressed['KeyE'] || keyPressed['KeyF']),
       useItem,
       isLocal: true
     };
@@ -1342,7 +1428,12 @@
         syncBundle(sceneOf(cp));
       }
     }
-    syncBundle(sceneOf(game.player));
+    // 注意：这里不要再 syncBundle(sceneOf(game.player))！
+    // 上面远程玩家循环会把 game.* 切成最后一个客户端的场景（例如 city，floor=null），
+    // 此时 syncBundle 主机场景会把主机 interior bundle 的 floor 覆盖成 null，
+    // 随后第 3 步激活该被污染的 interior bundle，autoPickupAll 访问 game.floor.items 会抛异常，
+    // 导致 update 崩溃、主机卡死、客户端收不到快照也一起卡住。
+    // 主机自己的 bundle 由第 3 步逐场景模拟时 activateScene+syncBundle 正确同步。
 
     // 暂停 / 存档（仅本地）
     if (keyPressed['Escape']) state = 'PAUSED';
@@ -1717,10 +1808,7 @@
         // 保持与玩家最小间距，避免直接重叠到玩家身上
         const MIN_GAP = 12;
         if (d > MIN_GAP) {
-          const nx = m.x + dx/d * spd * dt / 1000;
-          const ny = m.y + dy/d * spd * dt / 1000;
-          if (canWalkMonster(m, nx, m.y)) m.x = nx;
-          if (canWalkMonster(m, m.x, ny)) m.y = ny;
+          stepMonsterToward(m, p.x, p.y, spd, dt, now);
         }
         if (d2 <= def.atkRange*def.atkRange && now - m.lastAtk > def.atkCd) {
           // 是否新一轮扑咬：距上次攻击超过 1.2s 视为新一次"从远处扑过来"
@@ -1750,10 +1838,7 @@
         if (Math.abs(dx) > 2) m.facing = dx > 0 ? 2 : 1;
         if (d > 4) m.walkPhase = (m.walkPhase || 0) + dt / 120;
         const spd = def.speed * 30;
-        const nx = m.x + dx/d * spd * dt / 1000;
-        const ny = m.y + dy/d * spd * dt / 1000;
-        if (canWalkMonster(m, nx, m.y)) m.x = nx;
-        if (canWalkMonster(m, m.x, ny)) m.y = ny;
+        stepMonsterToward(m, m.wanderTx, m.wanderTy, spd, dt, now);
       }
     }
     if (game.scene === 'city') {
@@ -1775,6 +1860,114 @@
       if (!isWalkableTile(tx, ty)) return false;
     }
     return true;
+  }
+
+  // ---------- 僵尸寻路 ----------
+  // BFS 在 tile 网格上 4 向搜索从 (startTx,startTy) 到 (goalTx,goalTy) 的路径。
+  // 返回 tile 数组（不含起点，含终点）；找不到或超出预算返回 null。
+  function findPathBFS(startTx, startTy, goalTx, goalTy, maxNodes) {
+    const isCity = game.scene === 'city';
+    const W = isCity ? game.city.W : game.floor.W;
+    const H = isCity ? game.city.H : game.floor.H;
+    if (goalTx < 0 || goalTy < 0 || goalTx >= W || goalTy >= H) return null;
+    if (startTx === goalTx && startTy === goalTy) return [];
+    const startIdx = startTy * W + startTx;
+    const goalIdx = goalTy * W + goalTx;
+    const visited = new Uint8Array(W * H);
+    const cameFrom = new Int32Array(W * H).fill(-1);
+    const queue = new Int32Array(W * H);
+    let qHead = 0, qTail = 0;
+    visited[startIdx] = 1;
+    queue[qTail++] = startIdx;
+    let count = 1;
+    let found = false;
+    while (qHead < qTail) {
+      const idx = queue[qHead++];
+      if (idx === goalIdx) { found = true; break; }
+      const tx = idx % W, ty = (idx / W) | 0;
+      // 右
+      if (tx + 1 < W) {
+        const n = idx + 1; if (!visited[n] && isWalkableTile(tx + 1, ty)) { visited[n] = 1; cameFrom[n] = idx; queue[qTail++] = n; if (++count > maxNodes) return null; }
+      }
+      // 左
+      if (tx - 1 >= 0) {
+        const n = idx - 1; if (!visited[n] && isWalkableTile(tx - 1, ty)) { visited[n] = 1; cameFrom[n] = idx; queue[qTail++] = n; if (++count > maxNodes) return null; }
+      }
+      // 下
+      if (ty + 1 < H) {
+        const n = idx + W; if (!visited[n] && isWalkableTile(tx, ty + 1)) { visited[n] = 1; cameFrom[n] = idx; queue[qTail++] = n; if (++count > maxNodes) return null; }
+      }
+      // 上
+      if (ty - 1 >= 0) {
+        const n = idx - W; if (!visited[n] && isWalkableTile(tx, ty - 1)) { visited[n] = 1; cameFrom[n] = idx; queue[qTail++] = n; if (++count > maxNodes) return null; }
+      }
+    }
+    if (!found) return null;
+    const path = [];
+    let cur = goalIdx;
+    while (cur !== startIdx) {
+      if (cur < 0) return null;
+      path.push({ tx: cur % W, ty: (cur / W) | 0 });
+      cur = cameFrom[cur];
+    }
+    path.reverse();
+    return path;
+  }
+
+  // 让怪物 m 沿寻路路径走向世界坐标 (targetX,targetY)。
+  // 每隔 repathMs 或目标 tile 变化时重算路径；卡住时立即重算。
+  function stepMonsterToward(m, targetX, targetY, spd, dt, now) {
+    const ptx = Math.floor(targetX / TILE), pty = Math.floor(targetY / TILE);
+    const mtx = Math.floor(m.x / TILE), mty = Math.floor(m.y / TILE);
+    const needRepath = !m.path || m.pathTargetTx !== ptx || m.pathTargetTy !== pty || now > (m.repathAt || 0);
+    if (needRepath) {
+      m.path = findPathBFS(mtx, mty, ptx, pty, 3000);
+      m.pathTargetTx = ptx; m.pathTargetTy = pty;
+      m.repathAt = now + 700;
+      m.pathIdx = 0;
+    }
+    const prevX = m.x, prevY = m.y;
+    const step = spd * dt / 1000;
+    if (m.path && m.path.length > 0) {
+      if (m.pathIdx == null || m.pathIdx < 0) m.pathIdx = 0;
+      // 跳过已经走过的路径点
+      while (m.pathIdx < m.path.length) {
+        const wp = m.path[m.pathIdx];
+        const wpx = wp.tx * TILE + TILE / 2;
+        const wpy = wp.ty * TILE + TILE / 2;
+        if (Math.abs(wpx - m.x) > 5 || Math.abs(wpy - m.y) > 5) break;
+        m.pathIdx++;
+      }
+      let aimX, aimY;
+      if (m.pathIdx >= m.path.length) {
+        aimX = targetX; aimY = targetY; // 路径走完，直奔目标
+      } else {
+        const wp = m.path[m.pathIdx];
+        aimX = wp.tx * TILE + TILE / 2;
+        aimY = wp.ty * TILE + TILE / 2;
+      }
+      const ddx = aimX - m.x, ddy = aimY - m.y;
+      const dd = Math.hypot(ddx, ddy) || 1;
+      const nx = m.x + ddx / dd * step;
+      const ny = m.y + ddy / dd * step;
+      if (canWalkMonster(m, nx, m.y)) m.x = nx;
+      if (canWalkMonster(m, m.x, ny)) m.y = ny;
+    } else {
+      // 无路径（不可达或预算超限）：退回直接滑动
+      const dx = targetX - m.x, dy = targetY - m.y;
+      const d = Math.hypot(dx, dy) || 1;
+      const nx = m.x + dx / d * step, ny = m.y + dy / d * step;
+      if (canWalkMonster(m, nx, m.y)) m.x = nx;
+      if (canWalkMonster(m, m.x, ny)) m.y = ny;
+    }
+    // 卡住检测：长时间没动就强制重算路径
+    const moved = Math.hypot(m.x - prevX, m.y - prevY);
+    if (moved < 0.3) {
+      m.stuckTimer = (m.stuckTimer || 0) + dt;
+      if (m.stuckTimer > 400) { m.repathAt = 0; m.stuckTimer = 0; }
+    } else {
+      m.stuckTimer = 0;
+    }
   }
 
   function updateCamera() {
@@ -2570,6 +2763,15 @@
     const legSwing = Math.sin((phase) * 2) * 1;
     ctx.fillRect(sx - 3, sy + 4 + bob, 2, 3 + legSwing);
     ctx.fillRect(sx + 1, sy + 4 + bob, 2, 3 - legSwing);
+    // 攻击挥砍动画（沿瞄准方向），让主机也能看到远程玩家出拳
+    const nowR = performance.now();
+    if (p.lastAtk && nowR - p.lastAtk < 150) {
+      const aim = p.lastAim || { dx: dirX(p.facing), dy: dirY(p.facing) };
+      ctx.fillStyle = '#f0e0a0';
+      ctx.fillRect(sx + aim.dx*8 - 2, sy + aim.dy*8 - 2, 4, 4);
+      ctx.fillStyle = 'rgba(240,224,160,0.5)';
+      ctx.fillRect(sx + aim.dx*12 - 1, sy + aim.dy*12 - 1, 3, 3);
+    }
     // 名字 + HP 条
     ctx.fillStyle = '#fff';
     ctx.font = '9px Microsoft YaHei, Consolas, monospace';
