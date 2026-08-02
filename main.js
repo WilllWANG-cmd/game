@@ -101,7 +101,8 @@ ipcMain.handle('save:write', async (event, payload) => {
   const file = path.join(dir, `${payload.id}.json`);
   payload.updatedAt = Date.now();
   if (!payload.createdAt) payload.createdAt = payload.updatedAt;
-  fs.writeFileSync(file, JSON.stringify(payload, null, 2), 'utf-8');
+  // 异步写、去掉 pretty-print，减少卡顿与体积
+  await fs.promises.writeFile(file, JSON.stringify(payload), 'utf-8');
   return { ok: true, updatedAt: payload.updatedAt };
 });
 

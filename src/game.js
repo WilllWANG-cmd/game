@@ -16,6 +16,7 @@
   const canvas = document.getElementById('game');
   const ctx = canvas.getContext('2d');
   ctx.imageSmoothingEnabled = false;
+  let brush = ctx; // 可切换到离屏 canvas 做地表预烘焙
 
   // ---------- 输入 ----------
   const keys = {};
@@ -81,21 +82,59 @@
     road: '#3a3a44',
     roadLine: '#8a8a3a',
     sidewalk: '#5a5a64',
-    grass: '#2c4a2a',
-    grassDark: '#1e3a1e',
-    buildingWall: '#4a4a5a',
-    buildingWall2: '#3e3e4e',
-    buildingWin: '#1a2233',
-    buildingWinLit: '#7a8a4a',
-    door: '#6a3a1a',
-    doorFrame: '#3a1a0a',
-    interiorFloor: '#6a5a4a',
-    interiorFloor2: '#5a4a3a',
-    interiorWall: '#3a3a44',
-    interiorWall2: '#2a2a34',
+    grass: '#3a3a28',
+    grassDark: '#2a2a1c',
+    grassDry: '#4a4230',
+    curb: '#7a7a84',
+    sidewalkSeam: '#4a4a54',
+    gravel: '#4a463c',
+    gravelDark: '#3a362e',
+    gravelLit: '#5a564c',
+    parking: '#404048',
+    parkingLine: '#6a6a40',
+    buildingWall: '#4a423c',
+    buildingWall2: '#3a342e',
+    buildingWallBurn: '#2e2620',
+    buildingWin: '#0e1014',
+    buildingWinLit: '#6a5a28',
+    door: '#5a3220',
+    doorFrame: '#2a1810',
+    interiorFloor: '#5a4a3a',
+    interiorFloor2: '#4a3a2e',
+    interiorWall: '#3a342e',
+    interiorWall2: '#2a2420',
     stair: '#8a8a8a',
     stairDark: '#5a5a5a',
     blood: '#8a1a1a',
+    // 环境碎片用色
+    mud: '#3a2a18',
+    mudDark: '#2a1c10',
+    pothole: '#15151c',
+    potholeEdge: '#2a2a30',
+    wood: '#5a3a1a',
+    woodDark: '#3a2410',
+    woodLit: '#7a4a2a',
+    stone: '#7a7a82',
+    stoneDark: '#5a5a62',
+    stoneLit: '#9a9aa2',
+    rust: '#6a3a1a',
+    rustDark: '#4a2410',
+    driedBlood: '#5a1a14',
+    driedBloodDark: '#3a0e0c',
+    leaf: '#2a3a1a',
+    leafDark: '#1a2a14',
+    // 地标/障碍用色
+    metal: '#3a3a42',
+    metalDark: '#222229',
+    metalLit: '#5a5a64',
+    glass: '#9ab0c0',
+    ash: '#5a5048',
+    ashDark: '#3a342e',
+    busYellow: '#8a7a2a',
+    busYellowDark: '#5a4a18',
+    tire: '#1a1a1e',
+    sandbag: '#7a6a4a',
+    sandbagDark: '#5a4a30',
     ui: '#d0d0e0',
     uiDim: '#707080',
     uiBg: 'rgba(10,10,18,0.85)',
@@ -135,6 +174,7 @@
   // 0 路面 / 1 人行道 / 2 草地 / 3 楼房外墙(不可进) / 4 楼房门(可进) / 5 玩家所在楼入口
   function generateCity(seed) {
     const W = 80, H = 60;
+    const BW = 16, BH = 12; // 街区周期
     const map = new Uint8Array(W * H);
     const buildings = [];
 
@@ -144,32 +184,57 @@
     const srandi = (a, b) => Math.floor(a + rng() * (b - a));
     const schoice = (arr) => arr[Math.floor(rng() * arr.length)];
 
-    // 先全部填路面
-    map.fill(0);
+    // 铺装分层：街中路面(2格) + 两侧人行道(各1格) + 楼间院子（草/碎石/停车位）
+    // tile: 0 路面 / 1 人行道 / 2 草地 / 3 墙 / 4 门 / 5 home门 / 6 碎石空地 / 7 停车位
+    const blockCols = Math.floor(W / BW);
+    const blockRows = Math.floor(H / BH);
+    const yardKind = new Uint8Array(blockCols * blockRows); // 0草 1碎石 2停车
+    for (let byi = 0; byi < blockRows; byi++) {
+      for (let bxi = 0; bxi < blockCols; bxi++) {
+        const r = rng();
+        yardKind[byi * blockCols + bxi] = r < 0.55 ? 0 : (r < 0.82 ? 1 : 2);
+      }
+    }
 
-    // 横纵街道
     for (let y = 0; y < H; y++) {
       for (let x = 0; x < W; x++) {
-        // 街区划分：每 16 个 tile 一块，外圈是人行道
-        const bx = x % 16, by = y % 12;
-        if (bx === 0 || by === 0) {
-          map[y*W+x] = 1; // 人行道
+        const bx = x % BW, by = y % BH;
+        const onVRoad = bx === 1 || bx === 2;
+        const onHRoad = by === 1 || by === 2;
+        const onVSide = bx === 0 || bx === 3;
+        const onHSide = by === 0 || by === 3;
+        const i = y * W + x;
+        if (onVRoad || onHRoad) {
+          map[i] = 0;
+        } else if (onVSide || onHSide) {
+          map[i] = 1;
+        } else {
+          const bxi = Math.floor(x / BW), byi = Math.floor(y / BH);
+          const k = (bxi < blockCols && byi < blockRows) ? yardKind[byi * blockCols + bxi] : 0;
+          if (k === 1) {
+            map[i] = 6;
+          } else if (k === 2) {
+            // 停车位：院子内圈沥青，外圈留草边
+            const lx = bx - 4, ly = by - 4;
+            const yardW = BW - 4, yardH = BH - 4;
+            map[i] = (lx >= 1 && ly >= 1 && lx < yardW - 1 && ly < yardH - 1) ? 7 : 2;
+          } else {
+            map[i] = 2;
+          }
         }
       }
     }
 
-    // 在每个街区里放置 1-2 个建筑
-    const blockCols = Math.floor(W / 16);
-    const blockRows = Math.floor(H / 12);
+    // 在每个街区院子里放置建筑（避开街道路缘）
     let homePlaced = false;
     let bidx = 0;
     for (let byi = 0; byi < blockRows; byi++) {
       for (let bxi = 0; bxi < blockCols; bxi++) {
-        const ox = bxi * 16 + 1;
-        const oy = byi * 12 + 1;
-        const bw = srandi(7, 14);
-        const bh = srandi(6, 10);
-        if (ox + bw > bxi*16 + 15 || oy + bh > byi*12 + 11) continue;
+        const ox = bxi * BW + 4;
+        const oy = byi * BH + 4;
+        const bw = srandi(6, 11);
+        const bh = srandi(5, 7);
+        if (ox + bw > bxi * BW + 15 || oy + bh > byi * BH + 11) continue;
 
         const id = 'b' + (bidx++);
         const isHome = !homePlaced && (bxi === Math.floor(blockCols/2)) && (byi === Math.floor(blockRows/2));
@@ -191,7 +256,7 @@
             map[(oy+yy)*W + (ox+xx)] = 3;
           }
         }
-        // 门：底边中间
+        // 门：底边中间（门外是院子/路缘，可走）
         const dx = ox + Math.floor(bw/2);
         const dy = oy + bh - 1;
         map[dy*W + dx] = isHome ? 5 : 4;
@@ -206,7 +271,214 @@
       map[b.door.y * W + b.door.x] = 5;
     }
 
-    return { W, H, map, buildings, seed };
+    // 环境碎片：按「事故现场」聚簇，不在整张图上均匀乱撒。
+    //  每个现场 = 1 个大地标 + 周围障碍 + 密痕迹；现场外几乎干净。
+    // 用种子 RNG 生成，主机/客户端同种子完全一致，不进快照/存档。
+    const debris = [];
+    const occ = new Set();
+    const hot = new Uint8Array(W * H); // 现场热区：痕迹只在这里变密
+    const K = (x, y) => y * W + x;
+    const isGround = t => t === 0 || t === 1 || t === 2 || t === 6 || t === 7;
+    const isRoadish = t => t === 0 || t === 1;
+    function take(x, y, w = 1, h = 1) {
+      for (let dy = 0; dy < h; dy++) for (let dx = 0; dx < w; dx++) {
+        const ax = x + dx, ay = y + dy;
+        if (ax >= 0 && ax < W && ay >= 0 && ay < H) occ.add(K(ax, ay));
+      }
+    }
+    function markHot(cx, cy, r) {
+      for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+        if (dx * dx + dy * dy > r * r + 1) continue;
+        const ax = cx + dx, ay = cy + dy;
+        if (ax >= 0 && ax < W && ay >= 0 && ay < H) hot[K(ax, ay)] = 1;
+      }
+    }
+    function groundRect(x, y, w, h) {
+      if (x < 0 || y < 0 || x + w > W || y + h > H) return false;
+      for (let dy = 0; dy < h; dy++) for (let dx = 0; dx < w; dx++) {
+        const ax = x + dx, ay = y + dy;
+        if (!isGround(map[ay * W + ax]) || occ.has(K(ax, ay))) return false;
+      }
+      return true;
+    }
+    // 高过人物的地标：锚在路面，本体向上占一格（ty-1），避免插进楼墙
+    function placeTall(type, x, y, w, h, layer) {
+      const ty = y - (h - 1);
+      if (ty < 0) return false;
+      if (!groundRect(x, ty, w, h)) return false;
+      debris.push({ layer, type, tx: x, ty, w, h, ox: 0, oy: 0, v: Math.floor(rng() * 4) });
+      take(x, ty, w, h);
+      markHot(x + (w >> 1), y, 5);
+      return true;
+    }
+    function sprinkle(cx, cy, r, n, types) {
+      for (let i = 0; i < n; i++) {
+        const ang = rng() * Math.PI * 2;
+        const rad = rng() * r;
+        const x = Math.round(cx + Math.cos(ang) * rad);
+        const y = Math.round(cy + Math.sin(ang) * rad);
+        if (x < 0 || y < 0 || x >= W || y >= H) continue;
+        if (!isGround(map[y * W + x]) || occ.has(K(x, y))) continue;
+        const type = types[Math.floor(rng() * types.length)];
+        debris.push({
+          layer: 'trace', type, tx: x, ty: y,
+          ox: Math.floor(rng() * 6), oy: Math.floor(rng() * 6),
+          v: Math.floor(rng() * 8)
+        });
+        // 痕迹不永久占格，允许多件叠在同一现场
+        hot[K(x, y)] = 1;
+      }
+    }
+
+    // ---- 收集锚点：路口 / 楼门前 / 路段中点（对齐加宽后的路面中心）----
+    const anchors = [];
+    for (let byi = 1; byi < blockRows; byi++) {
+      for (let bxi = 1; bxi < blockCols; bxi++) {
+        const ix = bxi * BW + 1, iy = byi * BH + 1;
+        if (isRoadish(map[iy * W + ix])) anchors.push({ x: ix, y: iy, kind: 'cross' });
+      }
+    }
+    for (const b of buildings) {
+      const dx = b.door.x, dy = b.door.y;
+      let fx = dx, fy = dy + 1;
+      if (fy >= H || !isGround(map[fy * W + fx])) {
+        if (dx > 0 && isGround(map[dy * W + (dx - 1)])) { fx = dx - 1; fy = dy; }
+        else if (dx < W - 1 && isGround(map[dy * W + (dx + 1)])) { fx = dx + 1; fy = dy; }
+        else { fx = dx; fy = dy; }
+      }
+      anchors.push({ x: fx, y: fy, kind: 'door', doorX: dx, doorY: dy });
+    }
+    for (let byi = 0; byi < blockRows; byi++) {
+      for (let bxi = 0; bxi < blockCols; bxi++) {
+        const mx = bxi * BW + 8, my = byi * BH + 1; // 横街中段（上路心）
+        if (my > 0 && my < H && isRoadish(map[my * W + mx])) anchors.push({ x: mx, y: my, kind: 'road' });
+        const vx = bxi * BW + 1, vy = byi * BH + 6; // 纵街中段（左路心）
+        if (vx > 0 && vx < W && isRoadish(map[vy * W + vx])) anchors.push({ x: vx, y: vy, kind: 'road' });
+      }
+    }
+    // 打乱锚点（仍由种子决定）
+    for (let i = anchors.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      const tmp = anchors[i]; anchors[i] = anchors[j]; anchors[j] = tmp;
+    }
+
+    const sceneBudget = 10 + Math.floor(rng() * 5); // 10~14 个现场
+    let scenes = 0;
+    let buses = 0;
+
+    for (let ai = 0; ai < anchors.length && scenes < sceneBudget; ai++) {
+      const a = anchors[ai];
+      // 现场之间拉开距离，避免又糊成均匀噪声
+      let far = true;
+      for (const d of debris) {
+        if (d.layer !== 'landmark' && d.layer !== 'obstacle') continue;
+        const cx = d.tx + ((d.w || 1) >> 1), cy = d.ty + ((d.h || 1) >> 1);
+        if ((cx - a.x) * (cx - a.x) + (cy - a.y) * (cy - a.y) < 10 * 10) { far = false; break; }
+      }
+      if (!far) continue;
+
+      const roll = rng();
+      let placed = false;
+
+      if (a.kind === 'door' || (a.kind === 'cross' && roll < 0.35)) {
+        // 门前冲突：血迹拖出 + 矮路障 + 密碎砖/弹壳
+        if (a.doorX != null) {
+          const x = a.doorX, y = a.doorY;
+          let ddx = 0, ddy = 0;
+          if (map[y * W + (x - 1)] === 3) ddx = 1;
+          else if (map[y * W + (x + 1)] === 3) ddx = -1;
+          else if (map[(y - 1) * W + x] === 3) ddy = 1;
+          else ddy = 1;
+          const len = 3 + Math.floor(rng() * 2);
+          let bx = x, by = y, bw = 1, bh = 1;
+          if (ddx) { bw = len; if (ddx < 0) bx = x - len + 1; }
+          if (ddy) { bh = len; if (ddy < 0) by = y - len + 1; }
+          debris.push({ layer: 'trace', type: 'bloodtrail', tx: bx, ty: by, w: bw, h: bh, dx: ddx, dy: ddy, len, ox: 0, oy: 0, v: Math.floor(rng() * 4) });
+          for (let i = 0; i < len; i++) {
+            const ax = x + ddx * i, ay = y + ddy * i;
+            if (ax >= 0 && ax < W && ay >= 0 && ay < H) hot[K(ax, ay)] = 1;
+          }
+        }
+        // 门口横一截路障
+        const bw = 2 + Math.floor(rng() * 2);
+        if (placeTall('barricade', a.x - (bw >> 1), a.y, bw, 2, 'landmark')) placed = true;
+        else if (placeTall('barricade', a.x, a.y, 2, 2, 'landmark')) placed = true;
+        sprinkle(a.x, a.y, 4, 10 + Math.floor(rng() * 6), ['rubble', 'rubble', 'shell', 'bloodstain', 'mud']);
+      } else if (roll < 0.22 && buses < 2) {
+        // 巴士残骸现场
+        if (placeTall('bus', a.x - 1, a.y, 3, 2, 'landmark')) {
+          buses++;
+          placed = true;
+          if (rng() < 0.7) placeTall('barricade', a.x + 2, a.y + 1, 2, 2, 'obstacle');
+          sprinkle(a.x, a.y, 5, 14, ['rubble', 'mud', 'pothole', 'shell', 'bloodstain']);
+        }
+      } else if (roll < 0.5) {
+        // 路障封锁：墙 + 烧毁小车 + 坑洼圈
+        const bw = 2 + Math.floor(rng() * 2);
+        if (placeTall('barricade', a.x - (bw >> 1), a.y, bw, 2, 'landmark')) {
+          placed = true;
+          // 烧毁小车：2×2，齐胸到人高
+          if (!placeTall('burntcar', a.x + 2, a.y, 2, 2, 'obstacle')) {
+            placeTall('burntcar', a.x - 3, a.y, 2, 2, 'obstacle');
+          }
+          sprinkle(a.x, a.y, 4, 12, ['rubble', 'mud', 'pothole', 'shell']);
+        }
+      } else if (roll < 0.78) {
+        // 倒树砸路
+        const len = 3 + Math.floor(rng() * 2);
+        if (placeTall('fallentree', a.x - 1, a.y, len, 2, 'landmark')) {
+          placed = true;
+          sprinkle(a.x, a.y, 4, 10, ['rubble', 'rubble', 'mud', 'pothole']);
+        }
+      } else {
+        // 街角枯树 + 碎砖塌落
+        const th = 2 + Math.floor(rng() * 2);
+        if (placeTall('deadtree', a.x, a.y, 1, th, 'landmark')) {
+          placed = true;
+          sprinkle(a.x, a.y, 3, 8, ['rubble', 'rubble', 'mud']);
+        } else if (placeTall('barricade', a.x, a.y, 2, 2, 'landmark')) {
+          placed = true;
+          sprinkle(a.x, a.y, 3, 8, ['rubble', 'shell', 'mud']);
+        }
+      }
+
+      if (placed) scenes++;
+    }
+
+    // 墙根塌砖：只贴楼边成条/成堆，不撒满街
+    for (const b of buildings) {
+      if (rng() > 0.55) continue;
+      const side = Math.floor(rng() * 3); // 底/左/右
+      const count = 4 + Math.floor(rng() * 5);
+      for (let i = 0; i < count; i++) {
+        let x, y;
+        if (side === 0) { x = b.x + 1 + Math.floor(rng() * Math.max(1, b.w - 2)); y = b.y + b.h; }
+        else if (side === 1) { x = b.x - 1; y = b.y + 1 + Math.floor(rng() * Math.max(1, b.h - 2)); }
+        else { x = b.x + b.w; y = b.y + 1 + Math.floor(rng() * Math.max(1, b.h - 2)); }
+        if (x < 0 || y < 0 || x >= W || y >= H) continue;
+        if (!isGround(map[y * W + x]) || occ.has(K(x, y))) continue;
+        debris.push({ layer: 'trace', type: 'rubble', tx: x, ty: y, ox: Math.floor(rng() * 6), oy: Math.floor(rng() * 6), v: Math.floor(rng() * 8) });
+        hot[K(x, y)] = 1;
+      }
+    }
+
+    // 环境底噪：现场外极稀（~0.8%），现场内再补一点，拉开「干净路 vs 事故堆」对比
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const t = map[y * W + x];
+        if (!isGround(t) || occ.has(K(x, y))) continue;
+        const chance = hot[K(x, y)] ? 0.14 : 0.008;
+        if (rng() > chance) continue;
+        const rr = rng();
+        let type;
+        if (t === 0) type = rr < 0.45 ? 'pothole' : (rr < 0.75 ? 'mud' : (rr < 0.92 ? 'rubble' : 'shell'));
+        else if (t === 1) type = rr < 0.5 ? 'mud' : (rr < 0.85 ? 'rubble' : 'shell');
+        else type = rr < 0.55 ? 'mud' : 'rubble';
+        debris.push({ layer: 'trace', type, tx: x, ty: y, ox: Math.floor(rng() * 6), oy: Math.floor(rng() * 6), v: Math.floor(rng() * 8) });
+      }
+    }
+
+    return { W, H, map, buildings, seed, debris, hot };
   }
 
   // 建筑内部：一层楼。返回 tile 网格与实体列表
@@ -813,6 +1085,7 @@
         if (s.cityMap) {
           // 用主机的地图覆盖（与种子重建一致，覆盖以防差异）
           game.city.map = Uint8Array.from(s.cityMap);
+          invalidateCityGroundCache(game.city);
         }
         game.scene = 'city';
         game.curBuilding = null; game.floor = null;
@@ -1456,7 +1729,7 @@
         autoPickupAll(players);
         if (bundle.scene === 'city') updateCitySpawn(dt, players);
         // 雾气
-        if (bundle.scene === 'city') game.fogIntensity = 0.25 + 0.2 * Math.sin(performance.now() / 9000);
+        if (bundle.scene === 'city') game.fogIntensity = 0.34 + 0.16 * Math.sin(performance.now() / 9000);
         else game.fogIntensity = bundle.curBuilding && bundle.curBuilding.kind === 'fog' ? 0.35 : 0;
         // 清理死亡怪物
         if (game.scene === 'city') game.cityMonsters = game.cityMonsters.filter(m => m.alive);
@@ -1515,8 +1788,8 @@
     if (game.scene === 'city') {
       if (tx < 0 || ty < 0 || tx >= game.city.W || ty >= game.city.H) return false;
       const t = game.city.map[ty*game.city.W + tx];
-      // 0 路面 / 1 人行道 / 4 楼房门 / 5 home 门 可走；3 楼墙不可走
-      return t === 0 || t === 1 || t === 4 || t === 5;
+      // 0 路面 / 1 人行道 / 2 草地 / 6 碎石 / 7 停车位 / 4·5 门 可走；3 楼墙不可走
+      return t === 0 || t === 1 || t === 2 || t === 4 || t === 5 || t === 6 || t === 7;
     } else {
       const f = game.floor;
       if (tx < 0 || ty < 0 || tx >= f.W || ty >= f.H) return false;
@@ -1841,11 +2114,7 @@
         stepMonsterToward(m, m.wanderTx, m.wanderTy, spd, dt, now);
       }
     }
-    if (game.scene === 'city') {
-      game.cityMonsters = game.cityMonsters.filter(m => m.alive);
-    } else {
-      game.floor.monsters = game.floor.monsters.filter(m => m.alive);
-    }
+    // 死亡过滤统一在 update() 里做，避免重复 filter
   }
 
   function canWalkMonster(m, px, py) {
@@ -1863,6 +2132,37 @@
   }
 
   // ---------- 僵尸寻路 ----------
+  // 复用 BFS 缓冲，用 generation stamp 避免每次 new / fill 整张图
+  const pathPool = { size: 0, gen: 1, stamp: null, cameFrom: null, queue: null };
+  function ensurePathPool(n) {
+    if (pathPool.size < n) {
+      pathPool.stamp = new Uint16Array(n);
+      pathPool.cameFrom = new Int32Array(n);
+      pathPool.queue = new Int32Array(n);
+      pathPool.size = n;
+      pathPool.gen = 1;
+    }
+    pathPool.gen++;
+    if (pathPool.gen > 65000) {
+      pathPool.stamp.fill(0);
+      pathPool.gen = 1;
+    }
+    return pathPool;
+  }
+
+  // 直线可见：沿线段采样可走，成功则跳过 BFS
+  function canDirectWalk(m, targetX, targetY) {
+    const dx = targetX - m.x, dy = targetY - m.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 4) return true;
+    const steps = Math.ceil(d / 6);
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      if (!canWalkMonster(m, m.x + dx * t, m.y + dy * t)) return false;
+    }
+    return true;
+  }
+
   // BFS 在 tile 网格上 4 向搜索从 (startTx,startTy) 到 (goalTx,goalTy) 的路径。
   // 返回 tile 数组（不含起点，含终点）；找不到或超出预算返回 null。
   function findPathBFS(startTx, startTy, goalTx, goalTy, maxNodes) {
@@ -1873,11 +2173,12 @@
     if (startTx === goalTx && startTy === goalTy) return [];
     const startIdx = startTy * W + startTx;
     const goalIdx = goalTy * W + goalTx;
-    const visited = new Uint8Array(W * H);
-    const cameFrom = new Int32Array(W * H).fill(-1);
-    const queue = new Int32Array(W * H);
+    const pool = ensurePathPool(W * H);
+    const stamp = pool.stamp, cameFrom = pool.cameFrom, queue = pool.queue;
+    const gen = pool.gen;
     let qHead = 0, qTail = 0;
-    visited[startIdx] = 1;
+    stamp[startIdx] = gen;
+    cameFrom[startIdx] = -1;
     queue[qTail++] = startIdx;
     let count = 1;
     let found = false;
@@ -1885,21 +2186,33 @@
       const idx = queue[qHead++];
       if (idx === goalIdx) { found = true; break; }
       const tx = idx % W, ty = (idx / W) | 0;
-      // 右
       if (tx + 1 < W) {
-        const n = idx + 1; if (!visited[n] && isWalkableTile(tx + 1, ty)) { visited[n] = 1; cameFrom[n] = idx; queue[qTail++] = n; if (++count > maxNodes) return null; }
+        const n = idx + 1;
+        if (stamp[n] !== gen && isWalkableTile(tx + 1, ty)) {
+          stamp[n] = gen; cameFrom[n] = idx; queue[qTail++] = n;
+          if (++count > maxNodes) return null;
+        }
       }
-      // 左
       if (tx - 1 >= 0) {
-        const n = idx - 1; if (!visited[n] && isWalkableTile(tx - 1, ty)) { visited[n] = 1; cameFrom[n] = idx; queue[qTail++] = n; if (++count > maxNodes) return null; }
+        const n = idx - 1;
+        if (stamp[n] !== gen && isWalkableTile(tx - 1, ty)) {
+          stamp[n] = gen; cameFrom[n] = idx; queue[qTail++] = n;
+          if (++count > maxNodes) return null;
+        }
       }
-      // 下
       if (ty + 1 < H) {
-        const n = idx + W; if (!visited[n] && isWalkableTile(tx, ty + 1)) { visited[n] = 1; cameFrom[n] = idx; queue[qTail++] = n; if (++count > maxNodes) return null; }
+        const n = idx + W;
+        if (stamp[n] !== gen && isWalkableTile(tx, ty + 1)) {
+          stamp[n] = gen; cameFrom[n] = idx; queue[qTail++] = n;
+          if (++count > maxNodes) return null;
+        }
       }
-      // 上
       if (ty - 1 >= 0) {
-        const n = idx - W; if (!visited[n] && isWalkableTile(tx, ty - 1)) { visited[n] = 1; cameFrom[n] = idx; queue[qTail++] = n; if (++count > maxNodes) return null; }
+        const n = idx - W;
+        if (stamp[n] !== gen && isWalkableTile(tx, ty - 1)) {
+          stamp[n] = gen; cameFrom[n] = idx; queue[qTail++] = n;
+          if (++count > maxNodes) return null;
+        }
       }
     }
     if (!found) return null;
@@ -1919,11 +2232,35 @@
   function stepMonsterToward(m, targetX, targetY, spd, dt, now) {
     const ptx = Math.floor(targetX / TILE), pty = Math.floor(targetY / TILE);
     const mtx = Math.floor(m.x / TILE), mty = Math.floor(m.y / TILE);
+    // 直线可见则直接滑动，省掉 BFS
+    if (canDirectWalk(m, targetX, targetY)) {
+      m.path = null;
+      m.pathIdx = 0;
+      m.pathTargetTx = ptx; m.pathTargetTy = pty;
+      m.repathAt = now + 400;
+      const step = spd * dt / 1000;
+      const dx = targetX - m.x, dy = targetY - m.y;
+      const d = Math.hypot(dx, dy) || 1;
+      const nx = m.x + dx / d * step, ny = m.y + dy / d * step;
+      const prevX = m.x, prevY = m.y;
+      if (canWalkMonster(m, nx, m.y)) m.x = nx;
+      if (canWalkMonster(m, m.x, ny)) m.y = ny;
+      const moved = Math.hypot(m.x - prevX, m.y - prevY);
+      if (moved < 0.3) {
+        m.stuckTimer = (m.stuckTimer || 0) + dt;
+        if (m.stuckTimer > 400) { m.repathAt = 0; m.stuckTimer = 0; }
+      } else {
+        m.stuckTimer = 0;
+      }
+      return;
+    }
     const needRepath = !m.path || m.pathTargetTx !== ptx || m.pathTargetTy !== pty || now > (m.repathAt || 0);
     if (needRepath) {
       m.path = findPathBFS(mtx, mty, ptx, pty, 3000);
       m.pathTargetTx = ptx; m.pathTargetTy = pty;
-      m.repathAt = now + 700;
+      // 错开重算帧，避免多怪同一帧尖峰
+      const stagger = ((m._pathSalt || (m._pathSalt = (Math.random() * 5) | 0)) % 5) * 90;
+      m.repathAt = now + 700 + stagger;
       m.pathIdx = 0;
     }
     const prevX = m.x, prevY = m.y;
@@ -2135,25 +2472,80 @@
     renderDayNight();
   }
 
-  function renderCity() {
-    const { W, H, map } = game.city;
-    const cam = game.cam;
-    const tx0 = Math.floor(cam.x / TILE);
-    const ty0 = Math.floor(cam.y / TILE);
-    for (let ty = ty0; ty < ty0 + VIEW_TH + 1; ty++) {
-      for (let tx = tx0; tx < tx0 + VIEW_TW + 1; tx++) {
-        if (tx < 0 || ty < 0 || tx >= W || ty >= H) {
-          // 外部草地
-          ctx.fillStyle = PAL.grassDark;
-          ctx.fillRect(tx*TILE - cam.x, ty*TILE - cam.y, TILE, TILE);
-          continue;
+  // 把城市静态地表 + debris 预烘焙到离屏 canvas，每帧只 drawImage 可见区域
+  function ensureCityGroundCache(city) {
+    if (!city) return null;
+    if (city._groundCache) return city._groundCache;
+    const c = document.createElement('canvas');
+    c.width = city.W * TILE;
+    c.height = city.H * TILE;
+    const cctx = c.getContext('2d');
+    cctx.imageSmoothingEnabled = false;
+    const prev = brush;
+    brush = cctx;
+    try {
+      const { W, H, map } = city;
+      for (let ty = 0; ty < H; ty++) {
+        for (let tx = 0; tx < W; tx++) {
+          drawCityTile(map[ty * W + tx], tx * TILE, ty * TILE, tx, ty);
         }
-        const t = map[ty*W + tx];
-        const sx = tx*TILE - cam.x, sy = ty*TILE - cam.y;
-        drawCityTile(t, sx, sy, tx, ty);
       }
+      const debris = city.debris;
+      if (debris) {
+        for (const d of debris) {
+          // 地标/血迹拖痕没有 ox/oy；用 ||0，避免 NaN 导致 fillRect 静默失败
+          drawDebrisProp(d, d.tx * TILE + (d.ox || 0), d.ty * TILE + (d.oy || 0));
+        }
+      }
+    } finally {
+      brush = prev;
     }
-    // 城市掉落物
+    city._groundCache = c;
+    return c;
+  }
+
+  function invalidateCityGroundCache(city) {
+    if (city) city._groundCache = null;
+  }
+
+  function ensureInteriorGroundCache(floor) {
+    if (!floor) return null;
+    if (floor._groundCache) return floor._groundCache;
+    const c = document.createElement('canvas');
+    c.width = floor.W * TILE;
+    c.height = floor.H * TILE;
+    const cctx = c.getContext('2d');
+    cctx.imageSmoothingEnabled = false;
+    const prev = brush;
+    brush = cctx;
+    try {
+      for (let ty = 0; ty < floor.H; ty++) {
+        for (let tx = 0; tx < floor.W; tx++) {
+          drawInteriorTile(floor.map[ty * floor.W + tx], tx * TILE, ty * TILE, tx, ty);
+        }
+      }
+    } finally {
+      brush = prev;
+    }
+    floor._groundCache = c;
+    return c;
+  }
+
+  function renderCity() {
+    const city = game.city;
+    const cam = game.cam;
+    const cache = ensureCityGroundCache(city);
+    const sx = Math.floor(cam.x), sy = Math.floor(cam.y);
+    const sw = Math.min(VIEW_W, cache.width - sx);
+    const sh = Math.min(VIEW_H, cache.height - sy);
+    if (sw < VIEW_W || sh < VIEW_H) {
+      ctx.fillStyle = PAL.grassDark;
+      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    }
+    if (sw > 0 && sh > 0) ctx.drawImage(cache, sx, sy, sw, sh, 0, 0, sw, sh);
+    // 残骸旁漂浮火星（动态，不进缓存）
+    renderEmbers(city, cam);
+    // 城市掉落物（动态，不进缓存）
     const items = game.cityItems || [];
     for (const it of items) {
       if (it.taken) continue;
@@ -2161,85 +2553,711 @@
     }
   }
 
-  function drawCityTile(t, sx, sy, tx, ty) {
-    if (t === 0) {
-      // 路面
-      ctx.fillStyle = PAL.road;
-      ctx.fillRect(sx, sy, TILE, TILE);
-      // 路面斑点
-      if ((tx*7 + ty*13) % 5 === 0) {
-        ctx.fillStyle = PAL.asphalt;
-        ctx.fillRect(sx+3, sy+4, 2, 2);
+  // 烧毁车/巴士旁的小火点与漂浮灰烬
+  function renderEmbers(city, cam) {
+    const debris = city && city.debris;
+    if (!debris) return;
+    const now = performance.now();
+    const minX = cam.x - 16, minY = cam.y - 16;
+    const maxX = cam.x + VIEW_W + 16, maxY = cam.y + VIEW_H + 16;
+    for (const d of debris) {
+      if (d.type !== 'burntcar' && d.type !== 'bus') continue;
+      const w = d.w || 1, h = d.h || 1;
+      const wx = d.tx * TILE + (d.ox || 0);
+      const wy = d.ty * TILE + (d.oy || 0);
+      const ww = w * TILE, hh = h * TILE;
+      if (wx + ww < minX || wy + hh < minY || wx > maxX || wy > maxY) continue;
+      const baseX = wx - cam.x;
+      const baseY = wy - cam.y;
+      const seed = ((d.tx * 73856093) ^ (d.ty * 19349663) ^ (d.v || 0)) >>> 0;
+      const n = d.type === 'bus' ? 5 : 3;
+      for (let i = 0; i < n; i++) {
+        const phase = now / (220 + (seed % 90) + i * 37) + i * 1.7 + (seed % 7) * 0.3;
+        const bob = Math.sin(phase) * 0.5 + 0.5;
+        const rise = ((now / (40 + i * 11) + seed * 0.01 + i * 13) % (hh * 0.7));
+        const px = Math.floor(baseX + 4 + ((seed >> (i * 3)) & 15) + (i * 5) % Math.max(8, ww - 8));
+        const py = Math.floor(baseY + hh - 6 - rise);
+        const hot = bob > 0.55;
+        ctx.fillStyle = hot ? 'rgba(255,160,60,0.85)' : 'rgba(200,70,20,0.55)';
+        ctx.fillRect(px, py, hot ? 2 : 1, hot ? 2 : 1);
+        if (hot && (i & 1) === 0) {
+          ctx.fillStyle = 'rgba(255,220,140,0.45)';
+          ctx.fillRect(px, py - 1, 1, 1);
+        }
       }
-      // 路面中央黄线
-      if (ty % 6 === 3) {
-        ctx.fillStyle = PAL.roadLine;
-        ctx.fillRect(sx, sy + TILE/2 - 1, TILE, 2);
+      // 车底暖光一闪
+      const glow = 0.12 + 0.1 * Math.sin(now / 180 + (seed % 5));
+      ctx.fillStyle = `rgba(200,70,20,${glow})`;
+      ctx.fillRect(Math.floor(baseX + 4), Math.floor(baseY + hh - 5), ww - 8, 2);
+    }
+  }
+
+  function cityTileAt(tx, ty) {
+    const city = game.city;
+    if (!city || tx < 0 || ty < 0 || tx >= city.W || ty >= city.H) return -1;
+    return city.map[ty * city.W + tx];
+  }
+  function cityTileHot(tx, ty) {
+    const city = game.city;
+    if (!city || !city.hot || tx < 0 || ty < 0 || tx >= city.W || ty >= city.H) return 0;
+    return city.hot[ty * city.W + tx];
+  }
+
+  function drawCityTile(t, sx, sy, tx, ty) {
+    const BW = 16, BH = 12;
+    const bx = ((tx % BW) + BW) % BW, by = ((ty % BH) + BH) % BH;
+    const h = (tx * 73856093 ^ ty * 19349663) >>> 0;
+    const hot = cityTileHot(tx, ty);
+
+    if (t === 0) {
+      // 路面：事故热区坑多，远处更干净；黄线只画在真实街心
+      brush.fillStyle = PAL.road;
+      brush.fillRect(sx, sy, TILE, TILE);
+      const mudChance = hot ? 3 : 11;
+      const crackChance = hot ? 4 : 13;
+      if ((h % mudChance) === 0) {
+        brush.fillStyle = PAL.mudDark; brush.fillRect(sx + 1, sy + 2, 7, 4);
+        brush.fillStyle = PAL.mud; brush.fillRect(sx + 2, sy + 3, 5, 2);
+      }
+      if (hot && (h % 5) === 2) {
+        brush.fillStyle = 'rgba(58,42,24,0.5)';
+        brush.fillRect(sx + 8, sy + 8, 6, 5);
+      } else if (!hot && (h % 17) === 3) {
+        brush.fillStyle = 'rgba(58,42,24,0.35)';
+        brush.fillRect(sx + 8, sy + 8, 5, 4);
+      }
+      if ((h % crackChance) === 1) {
+        brush.fillStyle = PAL.potholeEdge;
+        brush.fillRect(sx + 4, sy + 2, 1, 6);
+        brush.fillRect(sx + 4, sy + 8, 4, 1);
+      }
+      if (hot && (h % 7) === 3) {
+        brush.fillStyle = PAL.pothole;
+        brush.fillRect(sx + 10, sy + 5, 1, 4);
+        brush.fillRect(sx + 9, sy + 8, 3, 1);
+      }
+      brush.fillStyle = PAL.asphalt;
+      if ((h % 3) === 0) brush.fillRect(sx + 3, sy + 4, 2, 2);
+      if ((h % 17) < 4) brush.fillRect(sx + 11, sy + 11, 1, 1);
+
+      const onHRoad = by === 1 || by === 2;
+      const onVRoad = bx === 1 || bx === 2;
+      // 横街中心线：画在两格路面接缝；路口不画，避免十字糊成一团
+      if (onHRoad && !onVRoad && by === 1) {
+        brush.fillStyle = (h % 4 === 0) ? '#7a6a20' : PAL.roadLine;
+        brush.fillRect(sx, sy + TILE - 1, TILE, 1);
+        brush.fillRect(sx, sy + TILE - 2, TILE, 1);
+        if ((h % 6) === 2) {
+          brush.fillStyle = PAL.road;
+          brush.fillRect(sx + 5, sy + TILE - 2, 4, 2);
+        }
+      }
+      // 纵街中心线
+      if (onVRoad && !onHRoad && bx === 1) {
+        brush.fillStyle = (h % 4 === 0) ? '#7a6a20' : PAL.roadLine;
+        brush.fillRect(sx + TILE - 1, sy, 1, TILE);
+        brush.fillRect(sx + TILE - 2, sy, 1, TILE);
+        if ((h % 6) === 2) {
+          brush.fillStyle = PAL.road;
+          brush.fillRect(sx + TILE - 2, sy + 5, 2, 4);
+        }
       }
     } else if (t === 1) {
-      // 人行道
-      ctx.fillStyle = PAL.sidewalk;
-      ctx.fillRect(sx, sy, TILE, TILE);
-      ctx.fillStyle = PAL.asphalt2;
-      ctx.fillRect(sx, sy, TILE, 1);
-      ctx.fillRect(sx, sy+TILE-1, TILE, 1);
+      // 人行道：水泥板缝 + 贴路边的路缘石
+      brush.fillStyle = PAL.sidewalk;
+      brush.fillRect(sx, sy, TILE, TILE);
+      brush.fillStyle = PAL.sidewalkSeam;
+      brush.fillRect(sx + 7, sy + 1, 1, TILE - 2);
+      brush.fillRect(sx + 1, sy + 7, TILE - 2, 1);
+      const nL = cityTileAt(tx - 1, ty), nR = cityTileAt(tx + 1, ty);
+      const nU = cityTileAt(tx, ty - 1), nD = cityTileAt(tx, ty + 1);
+      brush.fillStyle = PAL.curb;
+      if (nL === 0) brush.fillRect(sx, sy, 2, TILE);
+      if (nR === 0) brush.fillRect(sx + TILE - 2, sy, 2, TILE);
+      if (nU === 0) brush.fillRect(sx, sy, TILE, 2);
+      if (nD === 0) brush.fillRect(sx, sy + TILE - 2, TILE, 2);
+      if (hot || (h % 8) === 0) {
+        brush.fillStyle = 'rgba(58,42,24,0.4)';
+        brush.fillRect(sx + 2, sy + 4, 6, 4);
+      }
+      if (hot && (h % 5) === 2) {
+        brush.fillStyle = PAL.potholeEdge;
+        brush.fillRect(sx + 8, sy + 6, 1, 5);
+      }
     } else if (t === 2) {
-      ctx.fillStyle = PAL.grass;
-      ctx.fillRect(sx, sy, TILE, TILE);
-      if ((tx+ty) % 2 === 0) {
-        ctx.fillStyle = PAL.grassDark;
-        ctx.fillRect(sx+5, sy+6, 2, 2);
+      // 草地院子：去绿枯黄 + 热区焦土/灰烬
+      brush.fillStyle = hot ? PAL.ash : PAL.grass;
+      brush.fillRect(sx, sy, TILE, TILE);
+      brush.fillStyle = hot ? PAL.ashDark : PAL.grassDark;
+      if ((tx + ty) % 2 === 0) brush.fillRect(sx + 5, sy + 6, 2, 2);
+      if ((h % 5) === 0) brush.fillRect(sx + 2, sy + 3, 3, 1);
+      if ((h % 7) === 2) {
+        brush.fillStyle = PAL.grassDry;
+        brush.fillRect(sx + 9, sy + 9, 4, 2);
+        brush.fillRect(sx + 10, sy + 4, 1, 3);
+      }
+      if (hot || (h % 4) === 1) {
+        brush.fillStyle = 'rgba(58,50,40,0.45)';
+        brush.fillRect(sx + 3, sy + 8, 7, 3);
+      }
+      if (hot && (h % 3) === 0) {
+        brush.fillStyle = PAL.ashDark;
+        brush.fillRect(sx + 1, sy + 2, 5, 2);
+        brush.fillRect(sx + 8, sy + 5, 4, 1);
+      }
+    } else if (t === 6) {
+      // 碎石空地
+      brush.fillStyle = PAL.gravel;
+      brush.fillRect(sx, sy, TILE, TILE);
+      brush.fillStyle = PAL.gravelDark;
+      if ((h % 3) === 0) brush.fillRect(sx + 2, sy + 3, 3, 2);
+      if ((h % 5) === 1) brush.fillRect(sx + 9, sy + 8, 4, 3);
+      brush.fillStyle = PAL.gravelLit;
+      if ((h % 4) === 2) brush.fillRect(sx + 6, sy + 5, 2, 2);
+      if ((h % 7) < 3) brush.fillRect(sx + 11, sy + 2, 1, 1);
+      if (hot && (h % 4) === 0) {
+        brush.fillStyle = PAL.mud;
+        brush.fillRect(sx + 4, sy + 9, 6, 3);
+      }
+    } else if (t === 7) {
+      // 小停车位：深灰沥青 + 褪色车位线
+      brush.fillStyle = PAL.parking;
+      brush.fillRect(sx, sy, TILE, TILE);
+      brush.fillStyle = PAL.asphalt;
+      if ((h % 3) === 0) brush.fillRect(sx + 3, sy + 4, 2, 2);
+      brush.fillStyle = (h % 5 === 0) ? '#4a4a28' : PAL.parkingLine;
+      if (bx % 2 === 0) brush.fillRect(sx + TILE - 1, sy + 1, 1, TILE - 2);
+      if (by % 2 === 0) brush.fillRect(sx + 1, sy + TILE - 1, TILE - 2, 1);
+      if (hot && (h % 4) === 1) {
+        brush.fillStyle = PAL.mudDark;
+        brush.fillRect(sx + 2, sy + 7, 8, 3);
       }
     } else if (t === 3) {
-      // 楼房外墙
-      ctx.fillStyle = (tx + ty) % 2 === 0 ? PAL.buildingWall : PAL.buildingWall2;
-      ctx.fillRect(sx, sy, TILE, TILE);
-      // 窗户
+      // 楼房外墙：焦灰空壳，多数破窗黑洞，偶发应急灯
+      const scorched = (h % 5) < 2;
+      brush.fillStyle = scorched
+        ? PAL.buildingWallBurn
+        : ((tx + ty) % 2 === 0 ? PAL.buildingWall : PAL.buildingWall2);
+      brush.fillRect(sx, sy, TILE, TILE);
+      // 焦痕 / 烟熏条
+      if ((h % 3) === 0) {
+        brush.fillStyle = 'rgba(20,14,10,0.35)';
+        brush.fillRect(sx + (h % 5), sy + 1, 4 + (h % 4), TILE - 2);
+      }
+      if ((h % 11) === 2) {
+        brush.fillStyle = PAL.ashDark;
+        brush.fillRect(sx + 1, sy + TILE - 5, TILE - 2, 3);
+      }
+      // 窗户：多数黑洞/碎框，极少亮灯
       if ((tx % 3 === 1) && (ty % 3 === 1)) {
-        ctx.fillStyle = ((tx*ty) % 7 === 0) ? PAL.buildingWinLit : PAL.buildingWin;
-        ctx.fillRect(sx+3, sy+3, 10, 7);
-        ctx.fillStyle = PAL.buildingWall2;
-        ctx.fillRect(sx+7, sy+3, 1, 7);
+        const winRoll = h % 17;
+        if (winRoll === 0) {
+          brush.fillStyle = PAL.buildingWinLit;
+          brush.fillRect(sx + 3, sy + 3, 10, 7);
+        } else {
+          brush.fillStyle = PAL.buildingWin;
+          brush.fillRect(sx + 3, sy + 3, 10, 7);
+          // 碎框 / 空壳内暗
+          brush.fillStyle = '#08080c';
+          brush.fillRect(sx + 4, sy + 4, 8, 5);
+          if (winRoll % 3 === 1) {
+            brush.fillStyle = PAL.buildingWall2;
+            brush.fillRect(sx + 5, sy + 5, 3, 1);
+            brush.fillRect(sx + 8, sy + 7, 2, 1);
+          }
+        }
+        brush.fillStyle = PAL.buildingWallBurn;
+        brush.fillRect(sx + 7, sy + 3, 1, 7);
+        // 窗下烧黑边
+        brush.fillStyle = 'rgba(10,8,6,0.5)';
+        brush.fillRect(sx + 3, sy + 10, 10, 1);
+      }
+      // 崩角/露钢筋：墙脚 + 偶发中段缺口
+      const wallH = h;
+      const isYard = tt => tt === 0 || tt === 1 || tt === 2 || tt === 6 || tt === 7;
+      if ((wallH % 7) === 0 && ty + 1 < game.city.H) {
+        const below = game.city.map[(ty + 1) * game.city.W + tx];
+        if (isYard(below)) {
+          brush.fillStyle = PAL.pothole;
+          brush.fillRect(sx, sy + TILE - 4, 6, 4);
+          brush.fillStyle = PAL.stoneDark;
+          brush.fillRect(sx, sy + TILE - 4, 6, 1);
+          brush.fillStyle = PAL.rust;
+          brush.fillRect(sx + 2, sy + TILE - 3, 1, 3);
+          brush.fillRect(sx + 4, sy + TILE - 2, 1, 2);
+          brush.fillStyle = '#3a3a3a';
+          brush.fillRect(sx + 2, sy + TILE - 3, 1, 1);
+        }
+      }
+      if ((wallH % 13) === 3) {
+        brush.fillStyle = PAL.pothole;
+        brush.fillRect(sx + TILE - 5, sy + 2, 5, 6);
+        brush.fillStyle = PAL.ashDark;
+        brush.fillRect(sx + TILE - 5, sy + 2, 5, 1);
       }
     } else if (t === 4) {
-      // 普通楼门
-      ctx.fillStyle = PAL.buildingWall;
-      ctx.fillRect(sx, sy, TILE, TILE);
-      ctx.fillStyle = PAL.doorFrame;
-      ctx.fillRect(sx+2, sy+1, 12, 14);
-      ctx.fillStyle = PAL.door;
-      ctx.fillRect(sx+3, sy+2, 10, 12);
-      ctx.fillStyle = '#d0c040';
-      ctx.fillRect(sx+10, sy+8, 2, 2);
+      // 普通楼门（焦墙框）
+      brush.fillStyle = PAL.buildingWallBurn;
+      brush.fillRect(sx, sy, TILE, TILE);
+      brush.fillStyle = PAL.doorFrame;
+      brush.fillRect(sx+2, sy+1, 12, 14);
+      brush.fillStyle = PAL.door;
+      brush.fillRect(sx+3, sy+2, 10, 12);
+      brush.fillStyle = '#8a7020';
+      brush.fillRect(sx+10, sy+8, 2, 2);
     } else if (t === 5) {
-      // home 门（绿色）
-      ctx.fillStyle = PAL.buildingWall;
-      ctx.fillRect(sx, sy, TILE, TILE);
-      ctx.fillStyle = PAL.doorFrame;
-      ctx.fillRect(sx+2, sy+1, 12, 14);
-      ctx.fillStyle = '#2a8a4a';
-      ctx.fillRect(sx+3, sy+2, 10, 12);
-      ctx.fillStyle = '#5ad07a';
-      ctx.fillRect(sx+4, sy+3, 8, 1);
-      ctx.fillStyle = '#d0c040';
-      ctx.fillRect(sx+10, sy+8, 2, 2);
+      // home 门（仍可辨认，但墙皮焦化）
+      brush.fillStyle = PAL.buildingWallBurn;
+      brush.fillRect(sx, sy, TILE, TILE);
+      brush.fillStyle = PAL.doorFrame;
+      brush.fillRect(sx+2, sy+1, 12, 14);
+      brush.fillStyle = '#2a6a3a';
+      brush.fillRect(sx+3, sy+2, 10, 12);
+      brush.fillStyle = '#4aa060';
+      brush.fillRect(sx+4, sy+3, 8, 1);
+      brush.fillStyle = '#8a7020';
+      brush.fillRect(sx+10, sy+8, 2, 2);
+    }
+  }
+
+  // 环境碎片：泥泞 / 坑洼 / 倒树 / 碎砖 / 残破堡垒 / 干血迹。纯视觉、不阻挡移动。
+  function renderDebris() {
+    const debris = game.city && game.city.debris;
+    if (!debris) return;
+    const cam = game.cam;
+    const minX = cam.x - 8, minY = cam.y - 8;
+    const maxX = cam.x + VIEW_W + 8, maxY = cam.y + VIEW_H + 8;
+    for (const d of debris) {
+      const w = d.w || 1, h = d.h || 1;
+      const wx = d.tx * TILE + (d.ox || 0);
+      const wy = d.ty * TILE + (d.oy || 0);
+      const ww = w * TILE, hh = h * TILE;
+      if (wx + ww < minX || wy + hh < minY || wx > maxX || wy > maxY) continue;
+      const sx = wx - cam.x, sy = wy - cam.y;
+      drawDebrisProp(d, sx, sy);
+    }
+  }
+
+  function drawDebrisProp(d, sx, sy) {
+    const v = d.v || 0;
+    const Wp = (d.w || 1) * TILE, Hp = (d.h || 1) * TILE;
+    if (d.type === 'mud') {
+      // 泥泞：暗棕色不规则泥潭
+      brush.fillStyle = PAL.mud;
+      brush.fillRect(sx, sy + 1, 12, 5);
+      brush.fillRect(sx + 2, sy, 9, 7);
+      brush.fillStyle = PAL.mudDark;
+      brush.fillRect(sx + 1, sy + 3, 10, 3);
+      brush.fillRect(sx + 4, sy + 1, 5, 5);
+      // 反光的水洼
+      brush.fillStyle = 'rgba(60,70,90,0.25)';
+      brush.fillRect(sx + 3, sy + 2, 4, 2);
+    } else if (d.type === 'pothole') {
+      // 坑洼：深色坑 + 裂纹边缘
+      brush.fillStyle = PAL.potholeEdge;
+      brush.fillRect(sx, sy + 1, 12, 7);
+      brush.fillStyle = PAL.pothole;
+      brush.fillRect(sx + 2, sy + 2, 8, 5);
+      // 裂纹
+      brush.fillStyle = PAL.potholeEdge;
+      brush.fillRect(sx, sy + 3, 2, 1);
+      brush.fillRect(sx + 10, sy + 4, 3, 1);
+      brush.fillRect(sx + 5, sy + 7, 2, 1);
+    } else if (d.type === 'shell') {
+      // 弹壳：几枚散落的黄铜壳
+      brush.fillStyle = '#b0902a';
+      const pts = [[2,5],[5,3],[9,6],[12,4],[7,9],[3,11],[11,10]];
+      for (let i = 0; i < pts.length; i++) { const p = pts[(v + i) % pts.length]; brush.fillRect(sx + p[0], sy + p[1], 2, 1); }
+      brush.fillStyle = '#7a5a18';
+      for (let i = 0; i < pts.length; i++) { const p = pts[(v + i) % pts.length]; brush.fillRect(sx + p[0], sy + p[1], 1, 1); }
+    } else if (d.type === 'bloodtrail') {
+      // 血迹拖痕：从门洞向外拖出长 2~4 格的细线，越远越细，附散落小点
+      const len = d.len || 2;
+      const horiz = d.dx !== 0;
+      const dir = d.dx || d.dy || 1;
+      const L = len * TILE;
+      // 起点血泊（门一侧较浓）
+      brush.fillStyle = PAL.driedBloodDark;
+      if (horiz) { const px = dir > 0 ? sx : sx + L - 8; brush.fillRect(px, sy + 6, 8, 5); brush.fillRect(px + 1, sy + 5, 6, 7); }
+      else { const py = dir > 0 ? sy : sy + L - 8; brush.fillRect(sx + 6, py, 5, 8); brush.fillRect(sx + 5, py + 1, 7, 6); }
+      brush.fillStyle = PAL.driedBlood;
+      if (horiz) { const px = dir > 0 ? sx : sx + L - 8; brush.fillRect(px + 1, sy + 7, 6, 3); }
+      else { const py = dir > 0 ? sy : sy + L - 8; brush.fillRect(sx + 7, py + 1, 3, 6); }
+      // 拖痕主线（向远端逐渐变细变淡）
+      for (let i = 1; i < len; i++) {
+        const a = i / len;
+        const alpha = 0.6 - a * 0.35;
+        const t = i * TILE;
+        brush.fillStyle = 'rgba(90,26,20,' + alpha + ')';
+        if (horiz) { const px = dir > 0 ? sx + t : sx + L - t - TILE; brush.fillRect(px + 2, sy + 8, TILE - 4, Math.max(1, 3 - Math.floor(a*2))); }
+        else { const py = dir > 0 ? sy + t : sy + L - t - TILE; brush.fillRect(sx + 8, py + 2, Math.max(1, 3 - Math.floor(a*2)), TILE - 4); }
+      }
+      // 散落小点
+      brush.fillStyle = PAL.driedBloodDark;
+      for (let i = 0; i < len; i++) {
+        const t = i * TILE + 4 + (v % 3);
+        if (horiz) { const px = dir > 0 ? sx + t : sx + L - t; brush.fillRect(px, sy + 5, 1, 1); brush.fillRect(px + 3, sy + 11, 1, 1); }
+        else { const py = dir > 0 ? sy + t : sy + L - t; brush.fillRect(sx + 5, py, 1, 1); brush.fillRect(sx + 11, py + 3, 1, 1); }
+      }
+    } else if (d.type === 'fallentree') {
+      // 倒树地标：横跨多格的粗壮枯干，高过人物，焦黑 + 扭曲裸枝 + 断茬 + 根部碎石
+      const flip = (v % 2) ? 1 : -1;
+      // 地面阴影
+      brush.fillStyle = 'rgba(0,0,0,0.28)';
+      brush.fillRect(sx + 2, sy + Hp - 6, Wp - 4, 5);
+      // 树干（粗壮横倒，~20px 粗，高过人物）
+      const trunkY = sy + 6, trunkH = 20;
+      brush.fillStyle = PAL.woodDark;
+      brush.fillRect(sx + 3, trunkY, Wp - 6, trunkH);
+      brush.fillStyle = '#2a1c10';
+      brush.fillRect(sx + 3, trunkY, Wp - 6, 2);
+      brush.fillRect(sx + 3, trunkY + trunkH - 2, Wp - 6, 2);
+      // 树皮浅痕
+      brush.fillStyle = PAL.wood;
+      for (let i = 6; i < Wp - 6; i += 5) brush.fillRect(sx + i, trunkY + 3, 1, trunkH - 6);
+      // 断梢（劈裂尖刺）
+      const tipX = flip > 0 ? sx + Wp - 6 : sx + 3;
+      brush.fillStyle = '#1a1208';
+      brush.fillRect(tipX, trunkY - 2, 3, 3);
+      brush.fillRect(tipX + (flip > 0 ? 0 : 2), trunkY - 4, 1, 3);
+      brush.fillRect(tipX + (flip > 0 ? 2 : 0), trunkY + trunkH, 1, 3);
+      // 根部碎石土堆（另一端）
+      const rootX = flip > 0 ? sx + 2 : sx + Wp - 8;
+      brush.fillStyle = PAL.pothole;
+      brush.fillRect(rootX, sy + Hp - 8, 6, 5);
+      brush.fillStyle = PAL.stoneDark;
+      brush.fillRect(rootX + 1, sy + Hp - 7, 2, 2);
+      brush.fillRect(rootX + 4, sy + Hp - 6, 1, 1);
+      // 扭曲裸枝（向上斜伸，骨架状）
+      brush.fillStyle = PAL.woodDark;
+      const bx2 = sx + Math.floor(Wp * 0.35);
+      brush.fillRect(bx2, trunkY - 4, 1, 5);
+      brush.fillRect(bx2 + 1, trunkY - 5, 2, 1);
+      brush.fillRect(bx2 + 4, trunkY - 3, 1, 4);
+      brush.fillRect(bx2 + 3, trunkY - 4, 2, 1);
+      // 几片枯叶
+      brush.fillStyle = '#5a4a1a';
+      brush.fillRect(bx2 + 1, trunkY - 6, 1, 1);
+      brush.fillRect(bx2 + 5, trunkY - 5, 1, 1);
+    } else if (d.type === 'deadtree') {
+      // 直立枯树剪影：从地面向上竖起的焦黑骨架，高 2~3 格
+      const baseY = sy + Hp - 2;
+      // 根部碎石
+      brush.fillStyle = PAL.pothole;
+      brush.fillRect(sx + 4, baseY - 3, 8, 4);
+      brush.fillStyle = PAL.stoneDark;
+      brush.fillRect(sx + 5, baseY - 2, 2, 2);
+      // 主干（竖直，焦黑，向上收窄）
+      brush.fillStyle = PAL.woodDark;
+      brush.fillRect(sx + 7, sy + 4, 3, Hp - 8);
+      brush.fillStyle = '#2a1c10';
+      brush.fillRect(sx + 7, sy + 4, 1, Hp - 8);
+      brush.fillRect(sx + 9, sy + 4, 1, Hp - 8);
+      // 断顶（劈裂）
+      brush.fillStyle = '#1a1208';
+      brush.fillRect(sx + 6, sy + 2, 5, 3);
+      brush.fillRect(sx + 6, sy + 1, 1, 2);
+      brush.fillRect(sx + 10, sy + 1, 1, 2);
+      // 扭曲裸枝（向两侧伸出）
+      brush.fillStyle = PAL.woodDark;
+      const midY = sy + Math.floor(Hp * 0.4);
+      brush.fillRect(sx + 4, midY, 3, 1); brush.fillRect(sx + 4, midY - 2, 1, 3);
+      brush.fillRect(sx + 10, midY + 2, 3, 1); brush.fillRect(sx + 12, midY, 1, 3);
+      brush.fillRect(sx + 3, midY + 5, 2, 1); brush.fillRect(sx + 11, midY + 6, 2, 1);
+    } else if (d.type === 'burntcar') {
+      // 烧毁小车障碍：2×2 格，齐胸到人高，焦黑车壳 + 破窗 + 轮胎
+      const bodyY = sy + 6, bodyH = Hp - 12;
+      brush.fillStyle = 'rgba(0,0,0,0.28)';
+      brush.fillRect(sx + 2, sy + Hp - 5, Wp - 4, 4);
+      brush.fillStyle = PAL.ashDark;
+      brush.fillRect(sx + 2, bodyY, Wp - 4, bodyH);
+      brush.fillStyle = '#3a342e';
+      brush.fillRect(sx + 3, bodyY + 2, Wp - 6, bodyH - 4);
+      // 车顶塌陷
+      brush.fillStyle = '#1a1814';
+      brush.fillRect(sx + 3, bodyY, Wp - 6, 3);
+      // 破窗
+      brush.fillStyle = PAL.glass;
+      brush.fillRect(sx + 5, bodyY + 5, 8, 5);
+      brush.fillRect(sx + Wp - 14, bodyY + 5, 8, 5);
+      brush.fillStyle = PAL.pothole;
+      brush.fillRect(sx + 7, bodyY + 6, 4, 3);
+      // 门缝
+      brush.fillStyle = PAL.metalDark;
+      brush.fillRect(sx + Math.floor(Wp / 2) - 1, bodyY + 4, 2, bodyH - 6);
+      // 轮胎
+      brush.fillStyle = PAL.tire;
+      brush.fillRect(sx + 4, sy + Hp - 5, 5, 3);
+      brush.fillRect(sx + Wp - 9, sy + Hp - 5, 5, 3);
+      // 锈/焦痕
+      brush.fillStyle = PAL.rust;
+      brush.fillRect(sx + 4, bodyY + bodyH - 3, 6, 1);
+      brush.fillRect(sx + Wp - 12, bodyY + 3, 5, 1);
+      // 底火余烬（静态暖点，动态火星另层画）
+      brush.fillStyle = 'rgba(180,60,20,0.35)';
+      brush.fillRect(sx + 6, sy + Hp - 7, 4, 2);
+      brush.fillRect(sx + Wp - 12, sy + Hp - 6, 3, 1);
+    } else if (d.type === 'bus') {
+      // 残骸巴士地标：3×2 格，烧毁的黄色巴士，高过人物，破窗 + 轮胎 + 锈迹
+      const bodyY = sy + 3, bodyH = Hp - 10;
+      // 阴影
+      brush.fillStyle = 'rgba(0,0,0,0.3)';
+      brush.fillRect(sx + 2, sy + Hp - 5, Wp - 4, 4);
+      // 车身底色（烧毁的暗黄）
+      brush.fillStyle = PAL.busYellowDark;
+      brush.fillRect(sx + 2, bodyY, Wp - 4, bodyH);
+      brush.fillStyle = PAL.busYellow;
+      brush.fillRect(sx + 2, bodyY + 2, Wp - 4, bodyH - 4);
+      // 车顶焦黑
+      brush.fillStyle = PAL.ashDark;
+      brush.fillRect(sx + 2, bodyY, Wp - 4, 3);
+      // 车窗（一排破窗）
+      brush.fillStyle = PAL.glass;
+      for (let i = 0; i < 5; i++) brush.fillRect(sx + 5 + i * 8, bodyY + 4, 6, 5);
+      brush.fillStyle = PAL.metalDark;
+      for (let i = 0; i <= 5; i++) brush.fillRect(sx + 3 + i * 8, bodyY + 3, 2, 7);  // 窗柱
+      // 破洞（部分窗黑掉）
+      brush.fillStyle = PAL.pothole;
+      brush.fillRect(sx + 5 + (v % 3) * 8 + 1, bodyY + 5, 4, 3);
+      brush.fillRect(sx + 5 + ((v + 2) % 5) * 8 + 2, bodyY + 6, 3, 2);
+      // 车门
+      brush.fillStyle = PAL.metalDark;
+      brush.fillRect(sx + Wp - 6, bodyY + 4, 3, bodyH - 6);
+      // 轮胎（底部两个）
+      brush.fillStyle = PAL.tire;
+      brush.fillRect(sx + 6, sy + Hp - 5, 6, 4);
+      brush.fillRect(sx + Wp - 12, sy + Hp - 5, 6, 4);
+      brush.fillStyle = PAL.metalDark;
+      brush.fillRect(sx + 8, sy + Hp - 4, 2, 2);
+      brush.fillRect(sx + Wp - 10, sy + Hp - 4, 2, 2);
+      // 锈斑
+      brush.fillStyle = PAL.rust;
+      brush.fillRect(sx + 4, bodyY + bodyH - 3, 5, 1);
+      brush.fillRect(sx + Wp - 12, bodyY + 2, 4, 1);
+      // 底火余烬
+      brush.fillStyle = 'rgba(180,60,20,0.3)';
+      brush.fillRect(sx + 8, sy + Hp - 7, 5, 2);
+      brush.fillRect(sx + Wp - 16, sy + Hp - 6, 4, 1);
+    } else if (d.type === 'rubble') {
+      // 破碎石砖：像坍塌的瓦砾堆——大小不一、倾斜错位、混着木/铁，底部有尘土，半埋感
+      const variant = v % 4;
+      // 底部尘土/砂砾（让瓦砾咬在地面上，不悬空）
+      brush.fillStyle = 'rgba(90,80,70,0.4)';
+      brush.fillRect(sx, sy + 10, 15, 4);
+      brush.fillStyle = 'rgba(40,40,46,0.5)';
+      brush.fillRect(sx + 2, sy + 11, 11, 2);
+      if (variant === 0) {
+        // 大块断裂石板 + 碎片
+        brush.fillStyle = PAL.stoneDark;
+        brush.fillRect(sx, sy + 5, 7, 6);          // 大石板（倾斜）
+        brush.fillRect(sx + 6, sy + 7, 6, 4);      // 第二块（错位）
+        brush.fillStyle = PAL.stone;
+        brush.fillRect(sx + 1, sy + 5, 5, 2);
+        brush.fillRect(sx + 7, sy + 7, 4, 2);
+        brush.fillStyle = PAL.stoneLit;
+        brush.fillRect(sx + 1, sy + 5, 5, 1);     // 顶面高光
+        brush.fillRect(sx + 7, sy + 7, 4, 1);
+        // 裂纹
+        brush.fillStyle = PAL.pothole;
+        brush.fillRect(sx + 3, sy + 6, 1, 4);
+        // 小碎片散落
+        brush.fillStyle = PAL.stoneDark;
+        brush.fillRect(sx + 12, sy + 9, 2, 2);
+        brush.fillRect(sx + 1, sy + 11, 2, 1);
+      } else if (variant === 1) {
+        // 碎砖 + 木梁混合
+        brush.fillStyle = PAL.stoneDark;
+        brush.fillRect(sx + 1, sy + 6, 5, 5);
+        brush.fillRect(sx + 8, sy + 5, 5, 5);
+        brush.fillStyle = PAL.stone;
+        brush.fillRect(sx + 2, sy + 6, 3, 2);
+        brush.fillRect(sx + 9, sy + 5, 3, 2);
+        // 一根劈裂的木梁斜插
+        brush.fillStyle = PAL.wood;
+        brush.fillRect(sx + 4, sy + 4, 8, 2);
+        brush.fillStyle = PAL.woodDark;
+        brush.fillRect(sx + 4, sy + 4, 8, 1);
+        brush.fillRect(sx + 11, sy + 3, 2, 2);    // 翘起的断头
+        // 锈筋
+        brush.fillStyle = PAL.rust;
+        brush.fillRect(sx + 6, sy + 9, 1, 3);
+      } else if (variant === 2) {
+        // 多块小碎石堆成小丘
+        const bits = [[1,8,3,3],[5,7,3,3],[9,8,4,3],[3,11,3,2],[8,11,4,2],[12,9,2,3]];
+        brush.fillStyle = PAL.stoneDark;
+        for (const [bx,by,bw,bh] of bits) brush.fillRect(sx+bx, sy+by, bw, bh);
+        brush.fillStyle = PAL.stone;
+        for (const [bx,by,bw,bh] of bits) brush.fillRect(sx+bx+1, sy+by, bw-1, 1);
+        brush.fillStyle = PAL.stoneLit;
+        brush.fillRect(sx+2, sy+8, 1, 1);
+        brush.fillRect(sx+10, sy+8, 1, 1);
+        // 铁丝
+        brush.fillStyle = '#3a3a3a';
+        brush.fillRect(sx + 2, sy + 6, 1, 3);
+        brush.fillRect(sx + 2, sy + 6, 5, 1);
+      } else {
+        // 大块混凝土 + 钢筋外露
+        brush.fillStyle = PAL.stoneDark;
+        brush.fillRect(sx + 2, sy + 4, 9, 7);     // 大混凝土块
+        brush.fillStyle = PAL.stone;
+        brush.fillRect(sx + 3, sy + 4, 7, 3);
+        brush.fillStyle = PAL.stoneLit;
+        brush.fillRect(sx + 3, sy + 4, 7, 1);
+        // 大裂缝
+        brush.fillStyle = PAL.pothole;
+        brush.fillRect(sx + 6, sy + 5, 1, 5);
+        brush.fillRect(sx + 5, sy + 8, 3, 1);
+        // 外露钢筋
+        brush.fillStyle = PAL.rust;
+        brush.fillRect(sx + 11, sy + 6, 3, 1);
+        brush.fillRect(sx + 12, sy + 6, 1, 4);
+        brush.fillStyle = '#3a3a3a';
+        brush.fillRect(sx + 13, sy + 6, 1, 3);
+        // 小碎片
+        brush.fillStyle = PAL.stoneDark;
+        brush.fillRect(sx, sy + 10, 3, 2);
+      }
+    } else if (d.type === 'barricade') {
+      // 路障墙地标：2~3 格宽、高过人物的残墙，4 种变体
+      const variant = v % 4;
+      const wallTop = sy + 2, wallH = Hp - 8, baseY = sy + Hp - 6;
+      // 地面阴影
+      brush.fillStyle = 'rgba(0,0,0,0.3)';
+      brush.fillRect(sx + 1, baseY, Wp - 2, 5);
+      if (variant === 0) {
+        // 断裂木板墙：横板层层错位堆叠，断头外露
+        brush.fillStyle = PAL.woodDark;
+        brush.fillRect(sx + 1, wallTop, Wp - 2, wallH);
+        const rows = [wallTop, wallTop + 6, wallTop + 12, wallTop + 18];
+        const offs = [0, 2, -1, 1];
+        for (let i = 0; i < rows.length; i++) {
+          const ry = rows[i];
+          if (ry + 4 > wallTop + wallH) break;
+          brush.fillStyle = PAL.wood;
+          brush.fillRect(sx + 1 + offs[i], ry, Wp - 2 - Math.abs(offs[i]), 4);
+          brush.fillStyle = PAL.woodDark;
+          brush.fillRect(sx + 1 + offs[i], ry, Wp - 2 - Math.abs(offs[i]), 1);
+        }
+        // 劈裂断头
+        brush.fillStyle = PAL.woodDark;
+        brush.fillRect(sx + Wp - 4, wallTop - 2, 3, 4);
+        brush.fillRect(sx + Wp - 3, wallTop + 6, 2, 3);
+        // 钉子
+        brush.fillStyle = PAL.rust;
+        brush.fillRect(sx + 4, wallTop + 2, 1, 1);
+        brush.fillRect(sx + 10, wallTop + 8, 1, 1);
+        brush.fillRect(sx + Wp - 6, wallTop + 14, 1, 1);
+      } else if (variant === 1) {
+        // 沙袋墙：层层堆叠的土色沙袋，一个破裂漏沙
+        const rows = 4;
+        for (let r = 0; r < rows; r++) {
+          const ry = wallTop + r * 6;
+          if (ry + 5 > wallTop + wallH) break;
+          const cnt = Math.max(2, Math.floor((Wp - 2) / 7));
+          for (let c = 0; c < cnt; c++) {
+            const bx = sx + 1 + c * 7 + (r % 2 ? 3 : 0);
+            if (bx + 7 > sx + Wp - 1) break;
+            brush.fillStyle = PAL.sandbagDark;
+            brush.fillRect(bx, ry, 6, 5);
+            brush.fillStyle = PAL.sandbag;
+            brush.fillRect(bx, ry, 6, 4);
+            brush.fillStyle = PAL.stoneLit;
+            brush.fillRect(bx + 1, ry, 4, 1);
+          }
+        }
+        // 破裂漏沙
+        brush.fillStyle = PAL.mudDark;
+        brush.fillRect(sx + Wp - 8, baseY - 2, 6, 3);
+        brush.fillStyle = PAL.pothole;
+        brush.fillRect(sx + Wp - 6, wallTop + wallH - 6, 4, 4);
+      } else if (variant === 2) {
+        // 锈蚀波纹钢板 + 铁丝网
+        brush.fillStyle = PAL.metalDark;
+        brush.fillRect(sx + 1, wallTop, Wp - 2, wallH);
+        brush.fillStyle = PAL.metal;
+        brush.fillRect(sx + 2, wallTop + 2, Wp - 4, wallH - 4);
+        // 波纹横条
+        for (let i = 0; i < wallH - 4; i += 4) brush.fillRect(sx + 2, wallTop + 2 + i, Wp - 4, 1);
+        brush.fillStyle = PAL.metalLit;
+        brush.fillRect(sx + 2, wallTop + 2, Wp - 4, 1);
+        // 锈斑
+        brush.fillStyle = PAL.rust;
+        brush.fillRect(sx + 4, wallTop + 5, 4, 2);
+        brush.fillRect(sx + Wp - 10, wallTop + 10, 5, 2);
+        brush.fillStyle = PAL.rustDark;
+        brush.fillRect(sx + 8, wallTop + 14, 3, 3);
+        // 铁丝网（顶部斜拉）
+        brush.fillStyle = '#3a3a3a';
+        for (let i = 2; i < Wp - 2; i += 4) brush.fillRect(sx + i, wallTop - 2, 1, 4);
+        brush.fillRect(sx + 2, wallTop - 2, Wp - 4, 1);
+      } else {
+        // 碎混凝土墙 + 露钢筋
+        brush.fillStyle = PAL.stoneDark;
+        brush.fillRect(sx + 1, wallTop, Wp - 2, wallH);
+        brush.fillStyle = PAL.stone;
+        brush.fillRect(sx + 2, wallTop + 1, Wp - 4, wallH - 4);
+        brush.fillStyle = PAL.stoneLit;
+        brush.fillRect(sx + 2, wallTop + 1, Wp - 4, 1);
+        // 大裂缝
+        brush.fillStyle = PAL.pothole;
+        brush.fillRect(sx + Math.floor(Wp * 0.4), wallTop + 2, 1, wallH - 6);
+        brush.fillRect(sx + Math.floor(Wp * 0.4) - 2, wallTop + 8, 4, 1);
+        // 顶部露钢筋
+        brush.fillStyle = PAL.rust;
+        brush.fillRect(sx + 4, wallTop - 2, 3, 3);
+        brush.fillRect(sx + Wp - 8, wallTop - 3, 3, 4);
+        brush.fillStyle = '#3a3a3a';
+        brush.fillRect(sx + 5, wallTop - 3, 1, 3);
+        brush.fillRect(sx + Wp - 7, wallTop - 4, 1, 4);
+        // 嵌着的断木板
+        brush.fillStyle = PAL.wood;
+        brush.fillRect(sx + 3, wallTop + wallH - 6, 8, 3);
+        brush.fillStyle = PAL.woodDark;
+        brush.fillRect(sx + 3, wallTop + wallH - 6, 8, 1);
+      }
+    } else if (d.type === 'bloodstain') {
+      // 人们残留的血迹：干涸、不规则飞溅，不是一团。4 种变体，每种的泼溅形状都不同。
+      // 画法参考玩家受伤时的血迹：一个不规则主血泊 + 散落的飞溅小点 + 拖痕，分散不凝聚。
+      const variant = v % 4;
+      // 主血泊（不规则、不对称，由几个错位的块拼成，边缘呈锯齿状）
+      const pools = [
+        [[2,4,6,3],[3,3,4,2],[1,5,3,3],[5,6,4,2]],   // v0：偏左
+        [[6,3,5,3],[7,5,4,3],[5,4,3,2],[10,4,3,2]],   // v1：偏中右
+        [[3,5,5,3],[4,4,4,3],[2,6,3,2],[7,6,3,2]],    // v2：偏中
+        [[1,3,4,3],[5,4,5,3],[2,6,4,2],[9,5,3,2]]     // v3：偏左下
+      ][variant];
+      brush.fillStyle = PAL.driedBlood;
+      for (const [px,py,pw,ph] of pools) brush.fillRect(sx + px, sy + py, pw, ph);
+      // 更深的中心（不均匀）
+      brush.fillStyle = PAL.driedBloodDark;
+      for (const [px,py,pw,ph] of pools) brush.fillRect(sx + px + 1, sy + py + 1, Math.max(1,pw-2), Math.max(1,ph-1));
+      // 飞溅小点：散落在血泊四周较远处，大小不一、彼此分开，不凝聚成团
+      const droplets = [
+        [[0,1,1,1],[10,0,2,1],[13,3,1,1],[0,8,2,1],[14,7,1,2],[8,9,1,1],[12,10,2,1]],
+        [[0,2,1,1],[13,1,1,1],[14,5,2,1],[1,8,1,1],[11,9,1,1],[3,0,1,1],[14,9,2,1]],
+        [[0,0,1,1],[14,1,2,1],[13,6,1,1],[1,9,2,1],[12,8,1,1],[6,1,1,1],[9,9,1,1]],
+        [[0,2,2,1],[13,0,1,1],[14,7,1,1],[2,9,1,1],[11,9,2,1],[7,0,1,1],[13,10,1,1]]
+      ][variant];
+      brush.fillStyle = PAL.driedBloodDark;
+      for (const [px,py,pw,ph] of droplets) brush.fillRect(sx + px, sy + py, pw, ph);
+      // 细拖痕（被拖行时留下的拉丝）
+      brush.fillStyle = 'rgba(90,26,20,0.5)';
+      if (variant === 0) { brush.fillRect(sx + 8, sy + 5, 6, 1); brush.fillRect(sx + 9, sy + 7, 5, 1); }
+      else if (variant === 1) { brush.fillRect(sx, sy + 5, 6, 1); brush.fillRect(sx + 1, sy + 7, 5, 1); }
+      else if (variant === 2) { brush.fillRect(sx + 8, sy + 6, 6, 1); brush.fillRect(sx + 7, sy + 8, 5, 1); }
+      else { brush.fillRect(sx + 5, sy + 6, 7, 1); brush.fillRect(sx + 6, sy + 8, 6, 1); }
     }
   }
 
   function renderInterior() {
     const f = game.floor;
     const cam = game.cam;
-    const tx0 = Math.floor(cam.x / TILE);
-    const ty0 = Math.floor(cam.y / TILE);
-    for (let ty = ty0; ty < ty0 + VIEW_TH + 1; ty++) {
-      for (let tx = tx0; tx < tx0 + VIEW_TW + 1; tx++) {
-        if (tx < 0 || ty < 0 || tx >= f.W || ty >= f.H) continue;
-        const t = f.map[ty*f.W + tx];
-        const sx = tx*TILE - cam.x, sy = ty*TILE - cam.y;
-        drawInteriorTile(t, sx, sy, tx, ty);
-      }
-    }
-    // 物品
+    const cache = ensureInteriorGroundCache(f);
+    const sx = Math.floor(cam.x), sy = Math.floor(cam.y);
+    const sw = Math.min(VIEW_W, cache.width - sx);
+    const sh = Math.min(VIEW_H, cache.height - sy);
+    if (sw > 0 && sh > 0) ctx.drawImage(cache, sx, sy, sw, sh, 0, 0, sw, sh);
+    // 物品（动态）
     for (const it of f.items) {
       if (it.taken) continue;
       drawItem(it, cam);
@@ -2247,44 +3265,66 @@
   }
 
   function drawInteriorTile(t, sx, sy, tx, ty) {
-    // 地板
-    ctx.fillStyle = (tx + ty) % 2 === 0 ? PAL.interiorFloor : PAL.interiorFloor2;
-    ctx.fillRect(sx, sy, TILE, TILE);
+    // 地板：脏灰棋盘 + 裂缝/灰烬/干血迹，跟门外废城对齐
+    const h = (tx * 73856093 ^ ty * 19349663) >>> 0;
+    brush.fillStyle = (tx + ty) % 2 === 0 ? PAL.interiorFloor : PAL.interiorFloor2;
+    brush.fillRect(sx, sy, TILE, TILE);
+    if ((h % 5) === 0) {
+      brush.fillStyle = 'rgba(40,32,24,0.35)';
+      brush.fillRect(sx + 2, sy + 4, 7, 3);
+    }
+    if ((h % 7) === 2) {
+      brush.fillStyle = PAL.ashDark;
+      brush.fillRect(sx + 9, sy + 2, 4, 2);
+    }
+    if ((h % 11) === 3) {
+      brush.fillStyle = PAL.potholeEdge;
+      brush.fillRect(sx + 3, sy + 1, 1, 8);
+      brush.fillRect(sx + 3, sy + 9, 5, 1);
+    }
+    if ((h % 13) === 1) {
+      brush.fillStyle = 'rgba(90,26,20,0.35)';
+      brush.fillRect(sx + 6, sy + 10, 5, 2);
+    }
     if (t === 1) {
-      ctx.fillStyle = (tx + ty) % 2 === 0 ? PAL.interiorWall : PAL.interiorWall2;
-      ctx.fillRect(sx, sy, TILE, TILE);
-      // 墙顶亮边
-      ctx.fillStyle = '#4a4a54';
-      ctx.fillRect(sx, sy, TILE, 2);
+      brush.fillStyle = (tx + ty) % 2 === 0 ? PAL.interiorWall : PAL.interiorWall2;
+      brush.fillRect(sx, sy, TILE, TILE);
+      // 墙顶暗边（不再干净亮边）
+      brush.fillStyle = '#2a2420';
+      brush.fillRect(sx, sy, TILE, 2);
+      if ((h % 4) === 0) {
+        brush.fillStyle = 'rgba(20,14,10,0.4)';
+        brush.fillRect(sx + 1, sy + 3, 3, TILE - 4);
+      }
     } else if (t === 2) {
       // 楼梯上
-      ctx.fillStyle = PAL.stair;
-      ctx.fillRect(sx, sy, TILE, TILE);
-      ctx.fillStyle = PAL.stairDark;
-      for (let i = 0; i < 4; i++) ctx.fillRect(sx+1, sy+2+i*3, 14, 2);
-      ctx.fillStyle = '#d0d040';
-      ctx.fillRect(sx+6, sy+2, 4, 4);
+      brush.fillStyle = PAL.stair;
+      brush.fillRect(sx, sy, TILE, TILE);
+      brush.fillStyle = PAL.stairDark;
+      for (let i = 0; i < 4; i++) brush.fillRect(sx+1, sy+2+i*3, 14, 2);
+      brush.fillStyle = '#a09030';
+      brush.fillRect(sx+6, sy+2, 4, 4);
     } else if (t === 3) {
       // 楼梯下
-      ctx.fillStyle = PAL.stair;
-      ctx.fillRect(sx, sy, TILE, TILE);
-      ctx.fillStyle = PAL.stairDark;
-      for (let i = 0; i < 4; i++) ctx.fillRect(sx+1, sy+8-i*3, 14, 2);
-      ctx.fillStyle = '#d0d040';
-      ctx.fillRect(sx+6, sy+10, 4, 4);
+      brush.fillStyle = PAL.stair;
+      brush.fillRect(sx, sy, TILE, TILE);
+      brush.fillStyle = PAL.stairDark;
+      for (let i = 0; i < 4; i++) brush.fillRect(sx+1, sy+8-i*3, 14, 2);
+      brush.fillStyle = '#a09030';
+      brush.fillRect(sx+6, sy+10, 4, 4);
     } else if (t === 4) {
       // 出口门
-      ctx.fillStyle = PAL.interiorWall;
-      ctx.fillRect(sx, sy, TILE, TILE);
-      ctx.fillStyle = PAL.doorFrame;
-      ctx.fillRect(sx+2, sy, 12, 16);
-      ctx.fillStyle = '#2a6a8a';
-      ctx.fillRect(sx+3, sy+1, 10, 14);
-      ctx.fillStyle = '#d0c040';
-      ctx.fillRect(sx+10, sy+8, 2, 2);
+      brush.fillStyle = PAL.interiorWall;
+      brush.fillRect(sx, sy, TILE, TILE);
+      brush.fillStyle = PAL.doorFrame;
+      brush.fillRect(sx+2, sy, 12, 16);
+      brush.fillStyle = '#2a4a5a';
+      brush.fillRect(sx+3, sy+1, 10, 14);
+      brush.fillStyle = '#8a7020';
+      brush.fillRect(sx+10, sy+8, 2, 2);
       // 出口标识
-      ctx.fillStyle = '#e0e0e0';
-      ctx.fillRect(sx+5, sy+3, 6, 1);
+      brush.fillStyle = '#c0b8a0';
+      brush.fillRect(sx+5, sy+3, 6, 1);
     }
   }
 
@@ -2786,16 +3826,32 @@
     ctx.fillRect(sx - w/2, sy - 11, hpw, 2);
   }
 
+  let fogVignetteCanvas = null;
+  function ensureFogVignette() {
+    if (fogVignetteCanvas) return fogVignetteCanvas;
+    const c = document.createElement('canvas');
+    c.width = VIEW_W; c.height = VIEW_H;
+    const cctx = c.getContext('2d');
+    const grd = cctx.createRadialGradient(VIEW_W/2, VIEW_H/2, 60, VIEW_W/2, VIEW_H/2, 360);
+    grd.addColorStop(0, 'rgba(20,20,30,0)');
+    grd.addColorStop(1, 'rgba(20,20,30,1)');
+    cctx.fillStyle = grd;
+    cctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    fogVignetteCanvas = c;
+    return c;
+  }
+
   function renderFog(intensity) {
-    ctx.fillStyle = `rgba(154,160,176,${0.18 * intensity})`;
+    // 尘灰/焦橙色霾，取代冷灰阴天雾
+    ctx.fillStyle = `rgba(168,132,88,${0.22 * intensity})`;
     ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-    // 雾中人时雾更浓的暗角
+    ctx.fillStyle = `rgba(90,70,50,${0.08 * intensity})`;
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    // 雾中人时雾更浓的暗角（径向渐变预烘焙，只调 alpha）
     if (game.scene === 'city' && game.cityMonsters.some(m => m.kind === 'fogman')) {
-      const grd = ctx.createRadialGradient(VIEW_W/2, VIEW_H/2, 60, VIEW_W/2, VIEW_H/2, 360);
-      grd.addColorStop(0, 'rgba(20,20,30,0)');
-      grd.addColorStop(1, `rgba(20,20,30,${0.4 * intensity})`);
-      ctx.fillStyle = grd;
-      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+      ctx.globalAlpha = 0.4 * intensity;
+      ctx.drawImage(ensureFogVignette(), 0, 0);
+      ctx.globalAlpha = 1;
     }
   }
 
@@ -2821,40 +3877,59 @@
     return d < 0.5 ? '黄昏' : '黎明';
   }
 
+  let daySunCanvas = null;
+  let nightVgCanvas = null;
+  function ensureDaySunCanvas() {
+    if (daySunCanvas) return daySunCanvas;
+    const c = document.createElement('canvas');
+    c.width = VIEW_W; c.height = VIEW_H;
+    const cctx = c.getContext('2d');
+    // 焦橙逆光：像废墟天，而不是干净黄昼
+    const sun = cctx.createRadialGradient(VIEW_W * 0.55, -20, 20, VIEW_W * 0.45, 40, 460);
+    sun.addColorStop(0, 'rgba(255,170,90,0.16)');
+    sun.addColorStop(0.45, 'rgba(180,110,60,0.07)');
+    sun.addColorStop(1, 'rgba(120,90,60,0)');
+    cctx.fillStyle = sun;
+    cctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    cctx.fillStyle = 'rgba(140,100,60,0.045)';
+    cctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    daySunCanvas = c;
+    return c;
+  }
+  function ensureNightVgCanvas() {
+    if (nightVgCanvas) return nightVgCanvas;
+    const c = document.createElement('canvas');
+    c.width = VIEW_W; c.height = VIEW_H;
+    const cctx = c.getContext('2d');
+    const vg = cctx.createRadialGradient(VIEW_W / 2, VIEW_H / 2, 70, VIEW_W / 2, VIEW_H / 2, 380);
+    vg.addColorStop(0, 'rgba(0,0,0,0)');
+    vg.addColorStop(1, 'rgba(0,0,10,1)');
+    cctx.fillStyle = vg;
+    cctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    nightVgCanvas = c;
+    return c;
+  }
+
   function renderDayNight() {
     const darkness = getDarkness();
     if (darkness <= 0.01) {
-      // 白天：暖色阳光，从顶部洒下的柔光，整体明亮好看
-      const sun = ctx.createRadialGradient(VIEW_W * 0.5, -30, 30, VIEW_W * 0.5, -30, 420);
-      sun.addColorStop(0, 'rgba(255,236,170,0.12)');
-      sun.addColorStop(1, 'rgba(255,236,170,0)');
-      ctx.fillStyle = sun;
-      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-      // 极淡的暖色调
-      ctx.fillStyle = 'rgba(255,246,214,0.03)';
-      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+      ctx.drawImage(ensureDaySunCanvas(), 0, 0);
       return;
     }
-    // 夜晚：冷色暗调 + 暗角 + 微红血月 + 轻微闪烁（恐怖感，但不太暗）
+    // 夜晚：冷暗角 + 焦橙底火感 + 微红血月
     const now = performance.now();
     const flicker = 0.92 + 0.05 * Math.sin(now / 130) + 0.03 * Math.sin(now / 47);
-    // 基础暗蓝叠加（室内稍弱，有灯光）
     const indoorDamp = (game.scene === 'interior') ? 0.7 : 1;
     const baseA = 0.34 * darkness * indoorDamp;
-    ctx.fillStyle = `rgba(8,10,30,${baseA})`;
+    ctx.fillStyle = `rgba(12,10,22,${baseA})`;
     ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-    // 暗角 vignette
-    const vg = ctx.createRadialGradient(VIEW_W / 2, VIEW_H / 2, 70, VIEW_W / 2, VIEW_H / 2, 380);
-    vg.addColorStop(0, 'rgba(0,0,0,0)');
-    vg.addColorStop(1, `rgba(0,0,10,${0.5 * darkness * flicker})`);
-    ctx.fillStyle = vg;
+    ctx.globalAlpha = 0.5 * darkness * flicker;
+    ctx.drawImage(ensureNightVgCanvas(), 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = `rgba(70,18,8,${0.12 * darkness})`;
     ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-    // 血月微红（夜晚越深越明显）
-    ctx.fillStyle = `rgba(50,0,4,${0.10 * darkness})`;
-    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-    // 远处偶发"闪电"白光（极低概率，恐怖惊吓）
     if (Math.random() < 0.0015) {
-      ctx.fillStyle = 'rgba(220,220,255,0.18)';
+      ctx.fillStyle = 'rgba(255,200,160,0.12)';
       ctx.fillRect(0, 0, VIEW_W, VIEW_H);
     }
   }

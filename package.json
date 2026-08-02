@@ -17,26 +17,21 @@
   "build": {
     "appId": "com.gabrielle.pixelcity",
     "productName": "像素城市求生",
+    "directories": {
+      "output": "C:/Users/Gabrielle/AppData/Local/Temp/pixelcity-out"
+    },
     "files": [
       "main.js",
       "preload.js",
+      "party.js",
       "src/**/*",
       "assets/**/*"
     ],
     "win": {
       "target": [
-        "portable",
-        "nsis"
+        "portable"
       ],
       "icon": "assets/icon.png"
-    },
-    "nsis": {
-      "oneClick": false,
-      "perMachine": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "像素城市求生"
     },
     "portable": {
       "artifactName": "像素城市求生.exe"
