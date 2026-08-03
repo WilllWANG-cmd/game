@@ -35,11 +35,8 @@
     // 但 keyPressed 每帧被清空、clientTick 每 33ms 才发一次，会丢按键。
     // 只在首次按下时写缓冲（排除按键自动重复），clientTick 发送时再读走并清空。
     if (firstPress && state === 'PLAYING' && game && game.netMode === 'client') {
-      if (e.code === 'KeyE' || e.code === 'KeyF') party._edgeInteract = true;
-      else if (e.code === 'Digit1') party._edgeUseItem = 'medkit';
-      else if (e.code === 'Digit2') party._edgeUseItem = 'bandage';
-      else if (e.code === 'Digit3') party._edgeUseItem = 'canned';
-      else if (e.code === 'Digit4') party._edgeUseItem = 'water';
+      if (e.code === 'KeyF') party._edgeInteract = true;
+      else if (e.code === 'KeyR') party._edgeUseItem = 'hotbar';
     }
   });
   window.addEventListener('keyup', (e) => {
@@ -66,6 +63,14 @@
     if (namingPending) return; // 命名对话框打开时不响应画布点击
     const { x, y } = canvasPoint(e);
     handleClick(x, y);
+  });
+  canvas.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    if (namingPending) return;
+    if (state === 'PLAYING' && bagOpen) {
+      const { x, y } = canvasPoint(e);
+      handleBagClick(x, y, true);
+    }
   });
 
   // ---------- 工具 ----------
@@ -145,12 +150,282 @@
 
   // ---------- 物品类型 ----------
   const ITEMS = {
-    medkit:    { name: '医疗包', heal: 50, color: '#f0f0f0', sym: '✚', stack: 5 },
-    canned:    { name: '罐头',   heal: 15, color: '#c08030', sym: '▤', stack: 10 },
-    water:     { name: '矿泉水', heal: 10, color: '#4090d0', sym: '◉', stack: 10 },
-    bandage:   { name: '绷带',   heal: 20, color: '#e0e0c0', sym: '◑', stack: 8 },
-    ammo:      { name: '子弹',   heal: 0,  color: '#d0a030', sym: '⁝', stack: 99, kind: 'ammo' },
+    medkit:    { name: '医疗包', heal: 50, color: '#f0f0f0', sym: '✚', stack: 64 },
+    canned:    { name: '罐头',   heal: 15, color: '#c08030', sym: '▤', stack: 64 },
+    water:     { name: '矿泉水', heal: 10, color: '#4090d0', sym: '◉', stack: 64 },
+    bandage:   { name: '绷带',   heal: 20, color: '#e0e0c0', sym: '◑', stack: 64 },
+    ammo:      { name: '子弹',   heal: 0,  color: '#d0a030', sym: '⁝', stack: 64, kind: 'ammo' },
   };
+
+  // ---------- 背包：10 列 × 5 行，每格一种物品最多 64 ----------
+  const BAG_COLS = 10;
+  const BAG_ROWS = 5;
+  const BAG_SIZE = BAG_COLS * BAG_ROWS;
+  const BAG_STACK = 64;
+  // 快捷栏对应背包最左下角格子
+  const HOTBAR_SLOT = (BAG_ROWS - 1) * BAG_COLS;
+
+  function emptyBag() {
+    return Array.from({ length: BAG_SIZE }, () => null);
+  }
+
+  function syncInvFromBag(p) {
+    const inv = {};
+    if (!p.bag) { p.inv = inv; return; }
+    for (const slot of p.bag) {
+      if (!slot || !slot.type || !(slot.count > 0)) continue;
+      inv[slot.type] = (inv[slot.type] || 0) + slot.count;
+    }
+    p.inv = inv;
+  }
+
+  function ensureBag(p) {
+    if (!p) return;
+    if (!Array.isArray(p.bag) || p.bag.length !== BAG_SIZE) {
+      const prev = Array.isArray(p.bag) ? p.bag : [];
+      p.bag = emptyBag();
+      for (let i = 0; i < Math.min(prev.length, BAG_SIZE); i++) {
+        const s = prev[i];
+        if (s && s.type && (s.count|0) > 0) {
+          p.bag[i] = { type: s.type, count: Math.min(BAG_STACK, s.count|0) };
+        }
+      }
+    }
+    // 仅当格子为空时，才把旧 inv 字典迁入（避免有 bag 的存档重复叠加）
+    const hasBagItems = p.bag.some(s => s && s.type && (s.count|0) > 0);
+    if (!hasBagItems && p.inv && typeof p.inv === 'object') {
+      const entries = Object.entries(p.inv);
+      if (entries.length) {
+        p.inv = {}; // 先清空，避免 addItemToBag -> ensureBag 重入
+        for (const [type, count] of entries) {
+          if (type === 'ammo') continue;
+          let left = count|0;
+          while (left > 0) {
+            const n = Math.min(BAG_STACK, left);
+            if (!addItemToBag(p, type, n, true)) break;
+            left -= n;
+          }
+        }
+      }
+    }
+    syncInvFromBag(p);
+  }
+
+  function bagCanAccept(p, type, amount) {
+    ensureBag(p);
+    let left = amount|0;
+    if (left <= 0) return true;
+    for (let i = 0; i < BAG_SIZE && left > 0; i++) {
+      const s = p.bag[i];
+      if (!s) left -= Math.min(BAG_STACK, left);
+      else if (s.type === type && s.count < BAG_STACK) left -= Math.min(BAG_STACK - s.count, left);
+    }
+    return left <= 0;
+  }
+
+  // skipSync: 批量迁入时避免反复重建 inv
+  // 手持为空：新物品优先进手持；手持同类未满则继续叠入手持
+  function addItemToBag(p, type, amount, skipSync) {
+    ensureBag(p);
+    let left = amount|0;
+    if (left <= 0) return true;
+    const hot = p.bag[HOTBAR_SLOT];
+    if (!hot) {
+      const add = Math.min(BAG_STACK, left);
+      p.bag[HOTBAR_SLOT] = { type, count: add };
+      left -= add;
+    } else if (hot.type === type && hot.count < BAG_STACK) {
+      const add = Math.min(BAG_STACK - hot.count, left);
+      hot.count += add;
+      left -= add;
+    }
+    for (let i = 0; i < BAG_SIZE && left > 0; i++) {
+      if (i === HOTBAR_SLOT) continue;
+      const s = p.bag[i];
+      if (s && s.type === type && s.count < BAG_STACK) {
+        const add = Math.min(BAG_STACK - s.count, left);
+        s.count += add;
+        left -= add;
+      }
+    }
+    for (let i = 0; i < BAG_SIZE && left > 0; i++) {
+      if (!p.bag[i]) {
+        const add = Math.min(BAG_STACK, left);
+        p.bag[i] = { type, count: add };
+        left -= add;
+      }
+    }
+    if (!skipSync) syncInvFromBag(p);
+    return left <= 0;
+  }
+
+  function useBagSlotForPlayer(p, index) {
+    ensureBag(p);
+    const slot = p.bag[index];
+    if (!devMode && (!slot || !(slot.count > 0))) return;
+    const type = slot ? slot.type : null;
+    const def = ITEMS[type];
+    if (!def) return;
+    if (def.heal > 0) {
+      if (p.hp >= p.maxHp) {
+        if (p === game.player) toastMsg('生命已满', 1000);
+        return;
+      }
+      p.hp = Math.min(p.maxHp, p.hp + def.heal);
+      if (p === game.player) toastMsg('使用 ' + def.name + ' +' + def.heal + ' HP', 1200);
+    } else if (def.kind === 'ammo') {
+      p.ammo = (p.ammo || 0) + 10;
+      if (p === game.player) toastMsg('+' + def.name + ' x10', 1200);
+    } else {
+      return;
+    }
+    if (!devMode && slot) {
+      slot.count -= 1;
+      if (slot.count <= 0) p.bag[index] = null;
+      syncInvFromBag(p);
+    }
+  }
+
+  function useHotbarForPlayer(p) {
+    ensureBag(p);
+    if (!p.bag[HOTBAR_SLOT]) {
+      if (p === game.player) toastMsg('快捷栏为空', 800);
+      return;
+    }
+    useBagSlotForPlayer(p, HOTBAR_SLOT);
+  }
+
+  function cloneBagSlot(slot) {
+    if (!slot || !slot.type || !(slot.count > 0)) return null;
+    return { type: slot.type, count: slot.count|0 };
+  }
+
+  function getBagLayout() {
+    const slot = 28;
+    const gap = 3;
+    const gridW = BAG_COLS * slot + (BAG_COLS - 1) * gap;
+    const gridH = BAG_ROWS * slot + (BAG_ROWS - 1) * gap;
+    const leftW = 120;
+    const pad = 14;
+    const panelW = leftW + pad + gridW + pad * 2;
+    const panelH = Math.max(gridH, 160) + 48;
+    const panelX = Math.floor((VIEW_W - panelW) / 2);
+    const panelY = Math.floor((VIEW_H - panelH) / 2);
+    const gridX = panelX + pad + leftW + pad;
+    const gridY = panelY + 36;
+    return { slot, gap, gridX, gridY, panelX, panelY, panelW, panelH, leftW, pad };
+  }
+
+  function bagSlotAt(x, y) {
+    const L = getBagLayout();
+    if (x < L.gridX || y < L.gridY) return -1;
+    const cell = L.slot + L.gap;
+    const col = Math.floor((x - L.gridX) / cell);
+    const row = Math.floor((y - L.gridY) / cell);
+    if (col < 0 || col >= BAG_COLS || row < 0 || row >= BAG_ROWS) return -1;
+    const lx = x - L.gridX - col * cell;
+    const ly = y - L.gridY - row * cell;
+    if (lx < 0 || ly < 0 || lx >= L.slot || ly >= L.slot) return -1;
+    return row * BAG_COLS + col;
+  }
+
+  function markBagNetDirty() {
+    if (game && game.netMode === 'client') bagDirtyNet = true;
+  }
+
+  function returnBagCursor(p) {
+    p = p || (game && game.player);
+    if (!p || !bagCursor) { bagCursor = null; return; }
+    ensureBag(p);
+    const type = bagCursor.type;
+    let left = bagCursor.count|0;
+    bagCursor = null;
+    if (!type || left <= 0) return;
+    for (let i = 0; i < BAG_SIZE && left > 0; i++) {
+      const cell = p.bag[i];
+      if (cell && cell.type === type && cell.count < BAG_STACK) {
+        const add = Math.min(BAG_STACK - cell.count, left);
+        cell.count += add;
+        left -= add;
+      }
+    }
+    for (let i = 0; i < BAG_SIZE && left > 0; i++) {
+      if (!p.bag[i]) {
+        const add = Math.min(BAG_STACK, left);
+        p.bag[i] = { type, count: add };
+        left -= add;
+      }
+    }
+    syncInvFromBag(p);
+    markBagNetDirty();
+  }
+
+  function setBagOpen(open) {
+    open = !!open;
+    if (bagOpen && !open) returnBagCursor();
+    bagOpen = open;
+  }
+
+  // 类 MC：左键整组拿起/放下/交换/合并；右键拿一半或放 1 个
+  function clickBagSlot(index, right) {
+    if (!game || !game.player) return;
+    if (index < 0 || index >= BAG_SIZE) return;
+    ensureBag(game.player);
+    const bag = game.player.bag;
+    const slot = bag[index];
+
+    if (right) {
+      if (bagCursor) {
+        if (!slot) {
+          bag[index] = { type: bagCursor.type, count: 1 };
+          bagCursor.count -= 1;
+          if (bagCursor.count <= 0) bagCursor = null;
+        } else if (slot.type === bagCursor.type && slot.count < BAG_STACK) {
+          slot.count += 1;
+          bagCursor.count -= 1;
+          if (bagCursor.count <= 0) bagCursor = null;
+        }
+      } else if (slot && slot.count > 0) {
+        const take = Math.ceil(slot.count / 2);
+        bagCursor = { type: slot.type, count: take };
+        slot.count -= take;
+        if (slot.count <= 0) bag[index] = null;
+      }
+    } else {
+      if (!bagCursor) {
+        if (slot && slot.count > 0) {
+          bagCursor = cloneBagSlot(slot);
+          bag[index] = null;
+        }
+      } else if (!slot) {
+        bag[index] = cloneBagSlot(bagCursor);
+        bagCursor = null;
+      } else if (slot.type === bagCursor.type) {
+        const space = BAG_STACK - slot.count;
+        if (space > 0) {
+          const add = Math.min(space, bagCursor.count);
+          slot.count += add;
+          bagCursor.count -= add;
+          if (bagCursor.count <= 0) bagCursor = null;
+        } else {
+          const tmp = cloneBagSlot(slot);
+          bag[index] = cloneBagSlot(bagCursor);
+          bagCursor = tmp;
+        }
+      } else {
+        const tmp = cloneBagSlot(slot);
+        bag[index] = cloneBagSlot(bagCursor);
+        bagCursor = tmp;
+      }
+    }
+    syncInvFromBag(game.player);
+    markBagNetDirty();
+  }
+
+  function handleBagClick(x, y, right) {
+    const idx = bagSlotAt(x, y);
+    if (idx >= 0) clickBagSlot(idx, !!right);
+  }
 
   // ---------- 怪物类型 ----------
   const MON = {
@@ -619,6 +894,9 @@
   let saveCursor = 0;
   let saveHover = -1;
   let toast = null;     // {text, until}
+  let bagOpen = false;  // 是否打开背包界面
+  let bagCursor = null; // mouse held item {type,count}|null
+  let bagDirtyNet = false; // client bag sync flag
   let lastTime = 0;
   let playtimeAcc = 0;
   let devMode = false;  // 开发者模式：仅存档内（single 模式 PLAYING 中）按 F12 切换
@@ -950,7 +1228,7 @@
       id, name, isHost,
       hp: 100, maxHp: 100,
       x: 0, y: 0, facing: 0, walkPhase: 0,
-      inv: {}, weapon: 'fists', ammo: 0,
+      inv: {}, bag: emptyBag(), weapon: 'fists', ammo: 0,
       lastAtk: 0, lastShoot: 0, hurtFlash: 0,
       baseAtk: 12, atkRange: 22, atkCd: 380,
       isLocal: isHost, // 主机端只有 host 是 local
@@ -973,7 +1251,7 @@
       hp: p.hp, maxHp: p.maxHp,
       facing: p.facing, aimDx: (p.lastAim||{}).dx || 0, aimDy: (p.lastAim||{}).dy || 0,
       hurtFlash: p.hurtFlash || 0, walkPhase: p.walkPhase || 0,
-      ammo: p.ammo || 0, inv: p.inv || {},
+      ammo: p.ammo || 0, inv: p.inv || {}, bag: p.bag || emptyBag(),
       scene: p.scene || 'city',
       curBuildingId: p.curBuilding ? p.curBuilding.id : null,
       curFloor: p.curFloor || 0,
@@ -1140,6 +1418,8 @@
       game.player.hurtFlash = me.hurtFlash;
       game.player.ammo = me.ammo;
       game.player.inv = me.inv || {};
+      game.player.bag = me.bag || emptyBag();
+      ensureBag(game.player);
       game.player.lastAim = { dx: me.aimDx, dy: me.aimDy };
       game.player.name = me.name;
       // 用快照里的相对 age 还原本机 lastAtk/lastShoot，让客户端能看到自己挥拳/开火的动画
@@ -1172,7 +1452,7 @@
         _tx: p.x, _ty: p.y,
         hp: p.hp, maxHp: p.maxHp,
         facing: p.facing, walkPhase: p.walkPhase, hurtFlash: p.hurtFlash,
-        ammo: p.ammo, inv: p.inv || {}, lastAim: { dx: p.aimDx, dy: p.aimDy },
+        ammo: p.ammo, inv: p.inv || {}, bag: p.bag || emptyBag(), lastAim: { dx: p.aimDx, dy: p.aimDy },
         scene: p.scene || 'city', curBuilding: cb, curFloor: p.curFloor || 0
       };
     });
@@ -1187,6 +1467,11 @@
   // 解决：客户端本地立即预测自己的移动（碰撞用本机地图，和主机一致），快照回来只做纠错。
   function clientTick(dt) {
     if (!game || game.netMode !== 'client') return;
+    if (keyPressed['KeyE']) setBagOpen(!bagOpen);
+    if (keyPressed['Escape']) {
+      if (bagOpen) setBagOpen(false);
+      else state = 'PAUSED';
+    }
     game.timeMs = (game.timeMs || 0) + dt;
 
     // 1) 本地预测：每帧立即应用自己的移动输入，跟手不等网络
@@ -1209,7 +1494,16 @@
     inp.name = party.myName;
     party._lastSentMv = { mx: inp.mx, my: inp.my };
     party._sentInputs = (party._sentInputs || 0) + 1;
-    window.api.partySend({ type: 'input', mx: inp.mx, my: inp.my, aimDx: inp.aimDx, aimDy: inp.aimDy, attack: inp.attack, shoot: inp.shoot, interact: inp.interact, useItem: inp.useItem });
+    const payload = { type: 'input', mx: inp.mx, my: inp.my, aimDx: inp.aimDx, aimDy: inp.aimDy, attack: inp.attack, shoot: inp.shoot, interact: inp.interact, useItem: inp.useItem };
+    if (bagDirtyNet) {
+      ensureBag(game.player);
+      payload.bagSync = {
+        bag: game.player.bag.map(cloneBagSlot),
+        cursor: bagCursor ? cloneBagSlot(bagCursor) : null
+      };
+      bagDirtyNet = false;
+    }
+    window.api.partySend(payload);
     // 边沿输入已发出，清空缓冲，避免下一包重复触发 interact / useItem
     party._edgeInteract = false;
     party._edgeUseItem = null;
@@ -1244,7 +1538,8 @@
       x: 0, y: 0,            // 在场景中的像素坐标
       facing: 0,             // 0 下 1 左 2 右 3 上
       walkPhase: 0,
-      inv: {},               // type -> count
+      inv: {},               // 由 bag 汇总（兼容）
+      bag: emptyBag(),       // 50 格：{type,count}|null
       weapon: 'fists',
       ammo: 0,
       lastAtk: 0,
@@ -1366,6 +1661,7 @@
         x: game.player.x, y: game.player.y,
         facing: game.player.facing,
         inv: game.player.inv,
+        bag: game.player.bag,
         weapon: game.player.weapon,
         ammo: game.player.ammo,
         baseAtk: game.player.baseAtk,
@@ -1433,12 +1729,14 @@
       timeMs: data.timeMs || 0
     };
     game.player.scene = 'city'; game.player.curBuilding = null; game.player.curFloor = 0;
+    bagOpen = false; bagCursor = null; bagDirtyNet = false;
     // 旧版存档兼容：子弹曾经放在 inv.ammo，现在统一到 p.ammo（开枪资源）
     // 每个旧子弹物品按 AMMO_PER_PICKUP 折算成发数
     if (game.player.inv && game.player.inv.ammo) {
       game.player.ammo = (game.player.ammo || 0) + game.player.inv.ammo * AMMO_PER_PICKUP;
       delete game.player.inv.ammo;
     }
+    ensureBag(game.player);
     // 恢复场景
     if (data.scene === 'interior' && data.curBuildingId) {
       const b = city.buildings.find(x => x.id === data.curBuildingId);
@@ -1605,6 +1903,19 @@
   }
 
   function readLocalInput() {
+    // 背包打开时冻结操作（E 开关在 update/clientTick 处理）
+    if (bagOpen) {
+      const aim0 = aimDir();
+      return {
+        mx: 0, my: 0,
+        aimDx: aim0.dx, aimDy: aim0.dy,
+        attack: false,
+        shoot: false,
+        interact: false,
+        useItem: null,
+        isLocal: true
+      };
+    }
     let mx = 0, my = 0;
     if (keys['ArrowLeft'] || keys['KeyA']) mx -= 1;
     if (keys['ArrowRight'] || keys['KeyD']) mx += 1;
@@ -1613,22 +1924,19 @@
     if (mx !== 0 && my !== 0) { mx *= 0.7071; my *= 0.7071; }
     const aim = aimDir();
     const isClient = !!(game && game.netMode === 'client');
-    // 客户端用边沿缓冲（keydown 写入，clientTick 发送时清空），主机/单机用 keyPressed（每帧读）
+    // 客户端用边沿缓冲；主机/单机用 keyPressed
     let useItem = null;
     if (isClient) {
       useItem = party._edgeUseItem || null;
-    } else {
-      if (keyPressed['Digit1']) useItem = 'medkit';
-      else if (keyPressed['Digit2']) useItem = 'bandage';
-      else if (keyPressed['Digit3']) useItem = 'canned';
-      else if (keyPressed['Digit4']) useItem = 'water';
+    } else if (keyPressed['KeyR']) {
+      useItem = 'hotbar';
     }
     return {
       mx, my,
       aimDx: aim.dx, aimDy: aim.dy,
       attack: !!(keys['Space'] || keys['KeyJ']),
       shoot: !!keys['KeyK'],
-      interact: isClient ? !!party._edgeInteract : !!(keyPressed['KeyE'] || keyPressed['KeyF']),
+      interact: isClient ? !!party._edgeInteract : !!keyPressed['KeyF'],
       useItem,
       isLocal: true
     };
@@ -1697,6 +2005,13 @@
         });
         cp._prevInteract = !!raw.interact;
         cp._prevUseItem = raw.useItem || null;
+        if (raw.bagSync && Array.isArray(raw.bagSync.bag)) {
+          ensureBag(cp);
+          for (let i = 0; i < BAG_SIZE; i++) cp.bag[i] = cloneBagSlot(raw.bagSync.bag[i]);
+          cp._bagCursor = raw.bagSync.cursor ? cloneBagSlot(raw.bagSync.cursor) : null;
+          syncInvFromBag(cp);
+          delete raw.bagSync;
+        }
         stepPlayerEntity(cp, inp, dt, false);
         syncBundle(sceneOf(cp));
       }
@@ -1708,9 +2023,12 @@
     // 导致 update 崩溃、主机卡死、客户端收不到快照也一起卡住。
     // 主机自己的 bundle 由第 3 步逐场景模拟时 activateScene+syncBundle 正确同步。
 
-    // 暂停 / 存档（仅本地）
-    if (keyPressed['Escape']) state = 'PAUSED';
-    if (keyPressed['KeyR'] && game.netMode === 'single') saveGame();
+    // 背包 / 暂停（存档改到暂停菜单 R；游戏中 R = 用快捷栏）
+    if (keyPressed['KeyE']) setBagOpen(!bagOpen);
+    if (keyPressed['Escape']) {
+      if (bagOpen) setBagOpen(false);
+      else state = 'PAUSED';
+    }
 
     // 3. 逐场景模拟（仅含玩家的场景）
     if (game.netMode !== 'client') {
@@ -2017,37 +2335,19 @@
   }
 
   function useItemForPlayer(p, type) {
-    const def = ITEMS[type];
-    if (!def) return;
-    if (devMode && p === game.player) {
-      // 开发者模式：本地玩家无限使用，不消耗
-      if (def.heal > 0) {
-        if (p.hp < p.maxHp) {
-          p.hp = Math.min(p.maxHp, p.hp + def.heal);
-          if (p === game.player) toastMsg('使用 ' + def.name + ' +' + def.heal + ' HP', 1000);
-        } else if (p === game.player) {
-          toastMsg('生命已满', 800);
-        }
-      } else if (def.kind === 'ammo') {
-        p.ammo = (p.ammo || 0) + 10;
-        if (p === game.player) toastMsg('+' + def.name + ' x10', 1000);
-      }
+    if (type === 'hotbar') { useHotbarForPlayer(p); return; }
+    ensureBag(p);
+    // 兼容：按类型使用时优先快捷栏，再找其它格
+    if (p.bag[HOTBAR_SLOT] && p.bag[HOTBAR_SLOT].type === type) {
+      useBagSlotForPlayer(p, HOTBAR_SLOT);
       return;
     }
-    if ((p.inv[type] || 0) <= 0) return;
-    if (def.heal > 0) {
-      if (p.hp >= p.maxHp) {
-        if (p === game.player) toastMsg('生命已满', 1000);
+    for (let i = 0; i < BAG_SIZE; i++) {
+      if (p.bag[i] && p.bag[i].type === type) {
+        useBagSlotForPlayer(p, i);
         return;
       }
-      p.hp = Math.min(p.maxHp, p.hp + def.heal);
-      if (p === game.player) toastMsg('使用 ' + def.name + ' +' + def.heal + ' HP', 1200);
-    } else if (def.kind === 'ammo') {
-      p.ammo = (p.ammo || 0) + 10;
-      if (p === game.player) toastMsg('+' + def.name + ' x10', 1200);
     }
-    p.inv[type] -= 1;
-    if (p.inv[type] <= 0) delete p.inv[type];
   }
   function useItem(type) { useItemForPlayer(game.player, type); }
 
@@ -2322,10 +2622,12 @@
   // ---------- 拾取 ----------
   const AMMO_PER_PICKUP = 3; // 每个子弹物品给 3 发
   function pickupForPlayer(p, items) {
+    ensureBag(p);
     for (const it of items) {
       if (it.taken) continue;
       if (dist2(it.x, it.y, p.x, p.y) < 14*14) {
         const def = ITEMS[it.type];
+        if (!def) continue;
         if (it.type === 'ammo') {
           p.ammo = (p.ammo || 0) + AMMO_PER_PICKUP;
           it.taken = true;
@@ -2333,10 +2635,12 @@
           if (p === game.player) toastMsg('拾取 子弹 x' + AMMO_PER_PICKUP + '  (K 开枪)', 1100);
           continue;
         }
-        const cap = def.stack || 99;
-        if ((p.inv[it.type] || 0) >= cap) continue;
+        if (!devMode && !bagCanAccept(p, it.type, 1)) {
+          if (p === game.player) toastMsg('背包已满', 800);
+          continue;
+        }
+        addItemToBag(p, it.type, 1);
         it.taken = true;
-        p.inv[it.type] = (p.inv[it.type] || 0) + 1;
         game.stats.looted++;
         if (p === game.player) toastMsg('拾取 ' + def.name, 1000);
       }
@@ -3328,22 +3632,89 @@
     }
   }
 
+  // 8×8 像素物品图标（地上 / 快捷栏 / 背包共用）
+  function drawItemArt(type, x, y, size) {
+    const s = Math.max(8, size | 0);
+    const u = s / 8;
+    const px = (gx, gy, gw, gh, c) => {
+      ctx.fillStyle = c;
+      ctx.fillRect(
+        Math.round(x + gx * u),
+        Math.round(y + gy * u),
+        Math.max(1, Math.round(gw * u)),
+        Math.max(1, Math.round(gh * u))
+      );
+    };
+    switch (type) {
+      case 'medkit':
+        px(2, 0, 4, 1, '#7a7a88');
+        px(1, 1, 6, 6, '#e6e6ef');
+        px(1, 1, 6, 1, '#ffffff');
+        px(1, 6, 6, 1, '#a8a8b8');
+        px(0, 2, 1, 4, '#c8c8d4');
+        px(7, 2, 1, 4, '#9090a0');
+        px(3, 2, 2, 4, '#c02828');
+        px(2, 3, 4, 2, '#c02828');
+        px(3, 3, 2, 2, '#ff5858');
+        break;
+      case 'canned':
+        px(2, 0, 4, 1, '#d8d0b0');
+        px(1, 1, 6, 6, '#8e8e9c');
+        px(1, 1, 6, 1, '#c4c4ce');
+        px(1, 6, 6, 1, '#5e5e6c');
+        px(2, 2, 4, 3, '#b86820');
+        px(2, 3, 4, 1, '#e0a048');
+        px(3, 2, 2, 1, '#7a3810');
+        px(7, 2, 1, 3, '#b8b8c4');
+        break;
+      case 'water':
+        px(3, 0, 2, 1, '#1e5a96');
+        px(2, 1, 4, 1, '#4a98d0');
+        px(1, 2, 6, 5, '#2f7fbe');
+        px(2, 2, 1, 4, '#7ec8f0');
+        px(1, 6, 6, 1, '#245e96');
+        px(3, 3, 2, 2, '#b0e0ff');
+        px(4, 4, 1, 1, '#ffffff');
+        break;
+      case 'bandage':
+        px(1, 1, 6, 6, '#e6deca');
+        px(1, 1, 6, 1, '#f7f2e6');
+        px(1, 6, 6, 1, '#c2b89e');
+        px(2, 2, 4, 4, '#efe9db');
+        px(3, 2, 2, 4, '#d4cbb4');
+        px(0, 3, 2, 2, '#f3eee2');
+        px(0, 4, 3, 1, '#ddd4be');
+        px(5, 3, 1, 1, '#c04040');
+        break;
+      case 'ammo':
+        px(1, 1, 2, 5, '#c49a38');
+        px(1, 0, 2, 1, '#e8c868');
+        px(1, 5, 2, 2, '#7a5c1c');
+        px(2, 2, 1, 2, '#f2d878');
+        px(5, 2, 2, 5, '#c49a38');
+        px(5, 1, 2, 1, '#e8c868');
+        px(5, 6, 2, 1, '#7a5c1c');
+        px(6, 3, 1, 2, '#f2d878');
+        break;
+      default: {
+        const def = ITEMS[type];
+        px(1, 1, 6, 6, (def && def.color) || '#888888');
+        break;
+      }
+    }
+  }
+
   function drawItem(it, cam) {
-    const def = ITEMS[it.type];
     const sx = it.x - cam.x, sy = it.y - cam.y;
-    // 阴影
-    ctx.fillStyle = 'rgba(0,0,0,0.4)';
-    ctx.fillRect(sx - 4, sy + 4, 8, 2);
-    // 物品方块
-    ctx.fillStyle = def.color;
-    ctx.fillRect(sx - 4, sy - 4, 8, 8);
-    ctx.fillStyle = '#000';
-    ctx.fillRect(sx - 4, sy - 4, 8, 1);
-    ctx.fillRect(sx - 4, sy + 3, 8, 1);
-    // 高亮闪烁
-    const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 300);
-    ctx.fillStyle = `rgba(255,255,200,${0.2 + 0.3*pulse})`;
-    ctx.fillRect(sx - 5, sy - 5, 10, 1);
+    const size = 12;
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(sx - size / 2 + 1, sy + size / 2 - 1, size - 2, 2);
+    const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 280);
+    ctx.fillStyle = `rgba(255,220,120,${0.10 + 0.16 * pulse})`;
+    ctx.beginPath();
+    ctx.arc(sx, sy, size * 0.72, 0, Math.PI * 2);
+    ctx.fill();
+    drawItemArt(it.type, sx - size / 2, sy - size / 2, size);
   }
 
   // 绘制单只僵尸：人形、恐怖嘴、不同衣着、腐烂、血迹，攻击时扑咬
@@ -4010,41 +4381,15 @@
       ctx.fillText('[ 开发者模式 ]', 595, 14);
     }
 
-    // 物品栏（底部）
-    const invY = VIEW_H - 28;
-    ctx.fillStyle = PAL.uiBg;
-    ctx.fillRect(0, invY, VIEW_W, 28);
-    let xi = 8;
-    const order = ['medkit','bandage','canned','water','ammo'];
-    for (let i = 0; i < order.length; i++) {
-      const t = order[i];
-      // 子弹是直接资源，从 p.ammo 读取；其它从 inv 读取
-      const n = (t === 'ammo') ? (p.ammo || 0) : (p.inv[t] || 0);
-      const def = ITEMS[t];
-      ctx.fillStyle = '#1a1a24';
-      ctx.fillRect(xi, invY + 4, 24, 20);
-      ctx.fillStyle = (t === 'ammo' && (n > 0 || devMode)) ? '#ffe070' : def.color;
-      ctx.fillRect(xi + 2, invY + 6, 8, 8);
-      ctx.fillStyle = PAL.ui;
-      ctx.font = '8px Consolas, monospace';
-      ctx.fillText(def.name, xi + 12, invY + 12);
-      ctx.fillStyle = PAL.ui;
-      ctx.font = '10px Consolas, monospace';
-      ctx.fillText(devMode ? '∞' : ('x' + n), xi + 2, invY + 20);
-      // 快捷键（子弹格显示 K，其它显示数字）
-      ctx.fillStyle = PAL.uiDim;
-      ctx.font = '8px Consolas, monospace';
-      ctx.fillText((t === 'ammo') ? 'K' : ((i+1) + ''), xi + 20, invY + 22);
-      xi += 30;
-    }
-    // 提示
+    // 操作提示
     ctx.fillStyle = PAL.uiDim;
     ctx.font = '9px Consolas, monospace';
+    const tipY = VIEW_H - 58;
     const coop = game.netMode && game.netMode !== 'single';
     if (coop) {
-      const line = game.netMode === 'host' ? '主机：WASD移动 鼠标瞄准 空格/J挥拳 K开枪 E进出建筑  ESC暂停'
-                                          : '客户端：WASD移动 鼠标瞄准 空格/J挥拳 K开枪 E进出建筑  ESC暂停  (各自独立场景)';
-      ctx.fillText(line, 8, invY - 6);
+      const line = game.netMode === 'host' ? '主机：WASD移动 鼠标瞄准 空格/J挥拳 K开枪 E背包 F进出建筑 R快捷栏 ESC暂停'
+                                          : '客户端：WASD移动 鼠标瞄准 空格/J挥拳 K开枪 E背包 F进出建筑 R快捷栏 ESC暂停';
+      ctx.fillText(line, 8, tipY);
       // 队伍 HP（右上）—— 含各自场景标签
       const sceneTag = (pl) => pl.scene === 'city' ? '城' : ('F' + ((pl.curFloor||0)+1));
       let tx = VIEW_W - 8;
@@ -4067,11 +4412,15 @@
       }
       ctx.textAlign = 'left';
     } else {
-      ctx.fillText('WASD移动  鼠标瞄准  空格/J挥拳  K开枪  E互动  1-4用物品  R保存  ESC暂停', 8, invY - 6);
+      ctx.fillText('WASD移动  鼠标瞄准  空格/J挥拳  K开枪  E背包  F进出建筑  R用快捷栏  ESC暂停', 8, tipY);
     }
 
+    // 非背包：底部居中快捷栏（= 背包最左下角格）
+    if (!bagOpen) drawHotbarSlot();
+    else drawBagUI();
+
     // 鼠标准星
-    if (state === 'PLAYING') {
+    if (state === 'PLAYING' && !bagOpen) {
       const mx = Math.round(mousePos.x), my = Math.round(mousePos.y);
       ctx.fillStyle = 'rgba(255,224,112,0.85)';
       ctx.fillRect(mx - 5, my, 3, 1);
@@ -4083,6 +4432,146 @@
     }
   }
 
+  function drawBagItemIcon(type, x, y, size) {
+    if (!type || !ITEMS[type]) return;
+    drawItemArt(type, x, y, size || 16);
+  }
+
+  function drawHotbarSlot() {
+    ensureBag(game.player);
+    const slot = game.player.bag[HOTBAR_SLOT];
+    const size = 36;
+    const x = Math.floor(VIEW_W / 2 - size / 2);
+    const y = VIEW_H - size - 18;
+    ctx.fillStyle = 'rgba(10,10,18,0.9)';
+    ctx.fillRect(x - 3, y - 3, size + 6, size + 6);
+    ctx.strokeStyle = '#ffe070';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x - 3.5, y - 3.5, size + 7, size + 7);
+    ctx.fillStyle = '#1a1a24';
+    ctx.fillRect(x, y, size, size);
+    if (slot && slot.type && ITEMS[slot.type]) {
+      const def = ITEMS[slot.type];
+      const icon = 22;
+      drawBagItemIcon(slot.type, x + Math.floor((size - icon) / 2), y + Math.floor((size - icon) / 2) - 1, icon);
+      ctx.fillStyle = PAL.ui;
+      ctx.font = '10px Consolas, monospace';
+      ctx.textAlign = 'right';
+      ctx.fillText(devMode ? '∞' : String(slot.count|0), x + size - 3, y + size - 4);
+      ctx.textAlign = 'left';
+      ctx.fillStyle = PAL.uiDim;
+      ctx.font = '8px Consolas, monospace';
+      const nm = def.name;
+      ctx.fillText(nm, x + size / 2 - ctx.measureText(nm).width / 2, y - 6);
+    } else {
+      ctx.fillStyle = PAL.uiDim;
+      ctx.font = '9px Consolas, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('空', x + size / 2, y + size / 2 + 3);
+      ctx.textAlign = 'left';
+    }
+    ctx.fillStyle = PAL.uiDim;
+    ctx.font = '8px Consolas, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('R', x + size / 2, y + size + 10);
+    ctx.textAlign = 'left';
+  }
+
+  function drawPlayerSkinPreview(cx, cy, scale) {
+    const s = scale || 4;
+    const bob = 0;
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(cx - 5 * s, cy + 5 * s, 10 * s, 2 * s);
+    ctx.fillStyle = '#3a5a8a';
+    ctx.fillRect(cx - 4 * s, cy - 4 * s + bob, 8 * s, 8 * s);
+    ctx.fillStyle = '#d0a070';
+    ctx.fillRect(cx - 3 * s, cy - 8 * s + bob, 6 * s, 4 * s);
+    ctx.fillStyle = '#3a2a1a';
+    ctx.fillRect(cx - 3 * s, cy - 8 * s + bob, 6 * s, 2 * s);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(cx - 2 * s, cy - 5 * s + bob, 1 * s, 1 * s);
+    ctx.fillRect(cx + 1 * s, cy - 5 * s + bob, 1 * s, 1 * s);
+    ctx.fillStyle = '#2a2a3a';
+    ctx.fillRect(cx - 3 * s, cy + 4 * s + bob, 2 * s, 3 * s);
+    ctx.fillRect(cx + 1 * s, cy + 4 * s + bob, 2 * s, 3 * s);
+  }
+
+  function drawBagUI() {
+    ensureBag(game.player);
+    const p = game.player;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+    const L = getBagLayout();
+    const { slot, gap, panelX, panelY, panelW, panelH, leftW, pad, gridX, gridY } = L;
+
+    ctx.fillStyle = 'rgba(12,12,20,0.95)';
+    ctx.fillRect(panelX, panelY, panelW, panelH);
+    ctx.strokeStyle = '#606078';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(panelX + 0.5, panelY + 0.5, panelW - 1, panelH - 1);
+
+    ctx.fillStyle = PAL.ui;
+    ctx.font = 'bold 13px Microsoft YaHei, Consolas, monospace';
+    ctx.fillText('背包', panelX + pad, panelY + 22);
+    ctx.fillStyle = PAL.uiDim;
+    ctx.font = '9px Consolas, monospace';
+    ctx.fillText('左键移动 · 右键分半/放1 · 左下角=快捷栏(R) · E关闭', panelX + pad + 40, panelY + 22);
+
+    const skinCx = panelX + pad + leftW / 2;
+    const skinCy = panelY + 90;
+    ctx.fillStyle = '#1a1a24';
+    ctx.fillRect(panelX + pad, panelY + 36, leftW, panelH - 50);
+    drawPlayerSkinPreview(skinCx, skinCy, 5);
+    ctx.fillStyle = PAL.ui;
+    ctx.font = '11px Microsoft YaHei, Consolas, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(p.name || '玩家', skinCx, panelY + panelH - 28);
+    ctx.fillStyle = PAL.uiDim;
+    ctx.font = '9px Consolas, monospace';
+    ctx.fillText('HP ' + Math.ceil(p.hp) + '/' + p.maxHp, skinCx, panelY + panelH - 14);
+    ctx.textAlign = 'left';
+
+    const hover = bagSlotAt(mousePos.x, mousePos.y);
+    for (let i = 0; i < BAG_SIZE; i++) {
+      const col = i % BAG_COLS;
+      const row = Math.floor(i / BAG_COLS);
+      const sx = gridX + col * (slot + gap);
+      const sy = gridY + row * (slot + gap);
+      const isHot = i === HOTBAR_SLOT;
+      ctx.fillStyle = isHot ? '#2a2418' : '#1a1a24';
+      ctx.fillRect(sx, sy, slot, slot);
+      ctx.strokeStyle = (hover === i) ? '#ffffff' : (isHot ? '#ffe070' : '#3a3a48');
+      ctx.strokeRect(sx + 0.5, sy + 0.5, slot - 1, slot - 1);
+      const cell = p.bag[i];
+      if (cell && cell.type && ITEMS[cell.type]) {
+        const icon = 18;
+        drawBagItemIcon(cell.type, sx + Math.floor((slot - icon) / 2), sy + Math.floor((slot - icon) / 2) - 1, icon);
+        ctx.fillStyle = PAL.ui;
+        ctx.font = '9px Consolas, monospace';
+        ctx.textAlign = 'right';
+        ctx.fillText(devMode ? '∞' : String(cell.count|0), sx + slot - 2, sy + slot - 3);
+        ctx.textAlign = 'left';
+      }
+      if (isHot) {
+        ctx.fillStyle = '#ffe070';
+        ctx.font = '7px Consolas, monospace';
+        ctx.fillText('R', sx + 2, sy + 8);
+      }
+    }
+
+    if (bagCursor && bagCursor.type && ITEMS[bagCursor.type]) {
+      const icon = 18;
+      const ix = Math.round(mousePos.x) - Math.floor(icon / 2);
+      const iy = Math.round(mousePos.y) - Math.floor(icon / 2);
+      drawBagItemIcon(bagCursor.type, ix, iy, icon);
+      ctx.fillStyle = PAL.ui;
+      ctx.font = '10px Consolas, monospace';
+      ctx.textAlign = 'right';
+      ctx.fillText(devMode ? '∞' : String(bagCursor.count|0), ix + icon + 4, iy + icon + 2);
+      ctx.textAlign = 'left';
+    }
+  }
   function renderToast() {
     if (!toast) return;
     const now = performance.now();
@@ -4552,6 +5041,8 @@
       if (hitBtn(LOBBY_LEAVE, x, y)) { leaveParty(); state = 'MENU'; return; }
     } else if (state === 'CLIENT_LOBBY') {
       if (hitBtn(LOBBY_LEAVE, x, y)) { leaveParty(); state = 'MENU'; return; }
+    } else if (state === 'PLAYING') {
+      if (bagOpen) handleBagClick(x, y, false);
     } else if (state === 'PAUSED') {
       if (hitBtn(PAUSE_RESUME, x, y)) { state = 'PLAYING'; return; }
     } else if (state === 'DEAD') {
